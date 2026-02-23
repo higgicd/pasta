@@ -203,26 +203,9 @@ In comparison, PASTA can account for the four components in @fig-staconceptual b
 knitr::include_graphics("./img/sta_conceptual.png")
 ```
 
-```{=html}
-<!-- Texts from previous version:
-
-Overall, these improvements make the calculation of person-based accessibility more convenient and more realistic. However, despite the strong theoretical grounding of person-based measures in time geography, the disadvantages of these measures concern their operationalization and communicability [@geurs2004]. The significant data requirements and a lack of available data on activity episodes and the computational intensity of calculating STPs has meant that most studies examine only subsets of the population. Moreover, because STPs and PPAs are calculated at the individual-level, it can be difficult to use person-based measures to capture more spatially aggregate levels, which can limit the applicability of these measures in planning practice [@siddiq2021].
-
-In comparison, gravity-based accessibility measures do not have the aggregation issue because they measure accessibility at spatial levels, but they have their own their disadvantages as discussed above. 
-
-This study aims for bridging gravity- and person-based accessibility by proposing the measurement of PASTA. Person-based accessibility, as discussed before, can respond to the critique of place- and gravity-based accessibility by offering a sound theoretical basis in time-geography and accounting for individual mobility and time constraints. To address the limitation of calculating accessibility at the individual-level, PASTA aggregates person-based accessibility into spatial units and population-level totals with the goal of better reflecting the core of the accessibility concept as the intensity of the potential for interaction [@hansen1959].
--->
-```
-
 # Data and Methods
 
 This section begins by introducing the New York City study area. Next, to operationalize the time geographic concept of the STP in this work, three additional methodological steps are explained below, including the creation of activity episodes and space-time paths from travel survey data, the voxel-based data model for calculating multimodal STPs, and the aggregation of STPs into PASTA.
-
-```{=html}
-<!-- CL
-I am thinking maybe we could start with a more general method of PSATA (e.g., considering visit probability and service hours) and then introduce the data in this section. We could even combine the data and the results into one single section as the case example.
--->
-```
 
 ## Study Area
 
@@ -413,18 +396,6 @@ knitr::include_graphics("./img/PPA_layout.jpg")
 
 ## PASTA
 
-```{=html}
-<!---
-I wondered if we want to put this before the data and make it more general?
-E.g., change the dwell time into interaction potential(x, y, t, p, s)
-s refers to service availability. p refers to person-level interaction utility.
-And then we could say we use dwell time as an indicator of interaction potential.
-
-Some texts could be useful:
-It should be noted that the dwell time is used as an indicator of the potential for interaction at a certain location in this study as an example. More complex indicators may integrate the service availability and usage ulities to get a more realistic measure of interaction potential.
---->
-```
-
 Beyond the calculation of voxel-based space-time prisms and raster-based PPAs, the discretization of space and time in the voxel data model is critical for enabling the calculation of PASTA based on a variety of different aggregation strategies. For example, for a given person $p = 1$, the dwell time available at an intermediate location $x, y$ for a typical weekday is calculated from the multidimensional array as:
 
 $$
@@ -498,6 +469,7 @@ For the impedance function $f$, we adopt a positive approach and calibrate it to
 ```{r}
 #| label: prepare_fig_place_impedance
 #| echo: false
+#| warning: false
 #| eval: true
 ggsave(pdf_cdf_plot, filename = "./img/pdf_cdf_plot.jpg", width = 6, height = 4, dpi = 300)
 ```
@@ -525,6 +497,7 @@ The spatial patterns in the results show a general peaking in accessibility arou
 ```{r}
 #| label: prepare fig_ppas_by_day
 #| eval: true
+#| message: false
 #| echo: false
 
 fig_pasta_by_day <- tm_shape(pasta_by_day |> select("w_dwell_time")) +
@@ -581,6 +554,7 @@ To further explore the temporality of the results, @fig-pasta_by_period_and_day 
 ```{r}
 #| label: prepare fig_pasta_by_period_and_day
 #| eval: true
+#| message: false
 #| echo: false
 
 fig_pasta_by_period_and_day <- tm_shape(pasta_by_period_and_day |> 
@@ -645,6 +619,7 @@ Results for transit are generally consistent across days, although the magnitude
 ```{r}
 #| label: prepare fig_pasta_by_mode_and_day
 #| eval: true
+#| message: false
 #| echo: false
 
 fig_pasta_by_mode_and_day <- tm_shape(pasta_by_mode_and_day |>
@@ -696,6 +671,7 @@ As a final example, @fig-pasta_by_income_and_day shows results person-weighted p
 ```{r}
 #| label: prepare fig_pasta_by_income_and_day
 #| eval: true
+#| message: false
 #| echo: false
 
 fig_pasta_by_income_and_day <- tm_shape(
@@ -752,6 +728,7 @@ How do the results of the PASTA-based analysis presented above compare with thos
 ```{r}
 #| label: prepare fig_pasta_place_weekday_stars
 #| eval: true
+#| message: false
 #| echo: false
 
 fig_pasta_place_weekday_stars <- tm_shape(
@@ -850,6 +827,7 @@ These results are further broken down across the four modes, with @fig-place_by_
 ```{r}
 #| label: prepare fig_place_by_mode_weekday
 #| eval: true
+#| message: false
 #| echo: false
 
 fig_place_by_mode_weekday <- tm_shape(place_marketpotential_by_mode_weekday_stars |> select("grav_markpop")) + tm_raster(
