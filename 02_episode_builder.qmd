@@ -1,0 +1,402 @@
+---
+title: "02_episode_builder"
+format: html
+---
+
+# Setup
+
+Load packages
+
+```{r}
+library(tidyverse)
+library(fs)
+```
+
+Load data objects:
+
+```{r}
+output_path <- fs::dir_create("./output")
+load(file = fs::path(output_path, "01_data.Rdata"))
+```
+
+# Episode Builder
+
+define episode builder as a function
+
+```{r}
+episode_builder <- function(survey_data) {
+  episodes = survey_data |>
+    select(
+      hh_id,
+      person_id,
+      svyday_id,
+      trip_num,
+      trip_id,
+      orig_bg,
+      dest_bg,
+      orig_type,
+      dest_type,
+      departure_datetime,
+      arrival_datetime,
+      trip_mode,
+      trip_weight
+    ) |>
+    
+    arrange(person_id, svyday_id, trip_num) |>
+    
+    # get a timeblock_id corresponding to continuous survey sequences, e.g. continuous activity time spread over potentially multiple days
+    group_by(person_id) |>
+    mutate(timeblock_id = cumsum(svyday_id - lag(svyday_id, default = first(svyday_id)) > 1) + 1) |>
+    
+    # replace missing orig dest types with Missing
+    mutate(
+      orig_type = replace_na(orig_type, "Missing"),
+      dest_type = replace_na(dest_type, "Missing")
+    ) |>
+    ungroup() |>
+    
+    # add extra rows by uncounting
+    mutate(count = 2) |>
+    tidyr::uncount(count, .id = "segment") |>
+    
+    # main computations
+    group_by(person_id, timeblock_id) |>
+    #multidplyr::partition(cluster) |>
+    
+    mutate(
+      # define activity classes - stays are the new second uncounted rows
+      activity_class = case_when(segment == 2 ~ "Stay", .default = "Travel"),
+      
+      # times
+      start_datetime = case_when(
+        activity_class == "Stay" ~ dplyr::lag(arrival_datetime),
+        .default = departure_datetime
+      ),
+      end_datetime = case_when(
+        activity_class == "Stay" ~ dplyr::lead(departure_datetime),
+        .default = arrival_datetime
+      ),
+      
+      # locations
+      start_bg = case_when(activity_class == "Stay" ~ dplyr::lag(dest_bg), .default = orig_bg),
+      end_bg = case_when(activity_class == "Stay" ~ dplyr::lead(orig_bg), .default = dest_bg),
+      
+      # activity type
+      start_activity_type = case_when(activity_class == "Stay" ~ dplyr::lag(dest_type), .default = orig_type),
+      end_activity_type = case_when(activity_class == "Stay" ~ dplyr::lead(orig_type), .default = dest_type),
+      
+      # trip details
+      trip_mode = case_when(activity_class == "Stay" ~ NA_character_, .default = trip_mode),
+      trip_id = case_when(activity_class == "Stay" ~ NA_character_, .default = trip_id),
+      trip_weight = case_when(activity_class == "Stay" ~ NA, .default = trip_weight)
+    ) |>
+    
+    select(-segment) |>
+    
+    # LAST STAYS in timeblock_id sequence
+    ## fix each person's last stay episodes where leads will produce NAs
+    mutate(
+      end_datetime = case_when(
+        is.na(end_datetime) ~ lubridate::ymd_hms(paste0(
+          lubridate::date(start_datetime), " 23:59:59"
+        )),
+        .default = end_datetime
+      ),
+      end_bg = case_when(is.na(end_bg) ~ start_bg, .default = end_bg),
+      end_activity_type = case_when(is.na(end_activity_type) ~ "Last Stay", .default = end_activity_type)
+    ) |>
+    
+    # INITIAL STAYS in timeblock_id sequence
+    ## add a new row for the first day stay for a person before any trip occurs
+    slice(1, row_number()) |>
+    
+    ## fix up the first row only
+    mutate(
+      ## fix the start datetime to midnight
+      start_datetime = case_when(
+        row_number() == 1 ~ lubridate::floor_date(lead(start_datetime), unit = "day"), 
+        .default = start_datetime),
+      
+      ## classify initial stays (don't want to assume an activity)
+      start_activity_type = case_when(
+        row_number() == 1 ~ "Initial Stay", 
+        .default = start_activity_type),
+      
+      # pull end info from next row's start
+      end_datetime = case_when(row_number() == 1 ~ lead(start_datetime), .default = end_datetime),
+      end_bg = case_when(row_number() == 1 ~ lead(start_bg), .default = end_bg),
+      end_activity_type = case_when(row_number() == 1 ~ lead(start_activity_type), .default = end_activity_type),
+      
+      ## fix trip details to NA as this is a stay
+      trip_mode = case_when(row_number() == 1 ~ NA_character_, .default = trip_mode),
+      trip_id = case_when(row_number() == 1 ~ NA_character_, .default = trip_id),
+      trip_weight = case_when(row_number() == 1 ~ NA, .default = trip_weight),
+      
+      ## fix activity info
+      activity_class = case_when(row_number() == 1 ~ "Stay", .default = activity_class),
+      activity_desc = case_when(
+        activity_class == "Stay" & row_number() == n() ~ end_activity_type,
+        activity_class == "Stay" &
+          row_number() != n() ~ start_activity_type,
+        
+        .default = stringr::str_to_title(trip_mode)
+      )
+    ) |>
+    
+    # finish up
+    # add activity duration
+    mutate(
+      activity_duration = difftime(end_datetime, start_datetime, units = "mins"),
+      activity_duration = case_when(activity_duration < 0 ~ make_difftime(0, "minutes"), .default = activity_duration)
+    ) |>
+    
+    # do some calendar day-based computations
+    group_by(person_id, svyday_id) |>
+    
+    # add proper 24h calendar day id and standard weekday
+    mutate(episode_id = row_number()) |>
+    
+    # add standard weekday, if a final episode of the day happened past midnight, this keeps the start day intact
+    mutate(std_wday = case_when(
+      wday(first(start_datetime)) == 1 ~ "sunday",
+      wday(first(start_datetime)) == 7 ~ "saturday",
+      .default = "weekday"
+    )) |> 
+    
+    ungroup() |>
+    
+    # clean up
+    select(
+      hh_id,
+      person_id,
+      svyday_id,
+      timeblock_id,
+      std_wday,
+      episode_id,
+      trip_id,
+      trip_mode,
+      trip_weight,
+      activity_class,
+      activity_desc,
+      activity_duration,
+      start_datetime,
+      end_datetime,
+      start_activity_type,
+      end_activity_type,
+      start_bg,
+      end_bg
+    )
+  
+  return(episodes)
+}
+```
+
+Build the episodes (this takes a few minutes to run):
+
+```{r}
+episodes <- episode_builder(nycts_2018_linked)
+```
+
+## Person Weights
+
+add person weights
+
+```{r}
+episodes <- episodes |>
+  left_join(nycts_person_weights, by = "person_id") |>
+  group_by(person_id, svyday_id) |>
+  mutate(
+    # get person weight by survey standard day
+    per_weight = case_when(
+      std_wday == "weekday" ~ per_weight_day_wd,
+      std_wday == "saturday" ~ per_weight_day_sat,
+      .default = per_weight_day_sun
+    ),
+    
+    # if person weight is zero (error in survey data), take the mean trip weight instead (very few examples)
+    per_weight = case_when(per_weight == 0 ~ mean(trip_weight, na.rm = TRUE), .default = per_weight)
+  ) |>
+  ungroup() 
+```
+
+## Do some quality control
+
+- valid stay rules
+- starts and ends at same Block Group`valid_path`:
+
+valid cadence - search for breaks in the activity sequence, for example ID .. ends a day at home but then starts the next day at a different destinations, so a trip is implied/missing which breaks the sequence
+
+```{r}
+episodes <- episodes |>
+  group_by(person_id) |>
+  
+  # FLAG INVALID STAYS AND PATHS
+  mutate(
+    ## find where any start_bg does not match end_bg of previous episode - break in sequence
+    valid_path_line = case_when(
+      activity_desc == "Initial Stay" ~ "yes",
+      activity_desc != "Initial Stay" &
+        start_bg == lag(end_bg) ~ "yes",
+      .default = "no"
+    ),
+    
+    ## find where any stay takes place across two bgs (implying travel and a missed trip)
+    valid_stay_location = case_when(
+      activity_class == "Stay" & start_bg == end_bg ~ "yes",
+      activity_class == "Travel" ~ "travel",
+      .default = "no"
+    ),
+    
+    ## is there a valid stay-trip sequence or has a missing/implied trip occurred?
+    valid_stay_trip_sequence = case_when(
+      activity_class == "Stay" &
+        (activity_desc != "Initial Stay" |
+           activity_desc != "Last Stay") &
+        start_activity_type != end_activity_type ~ "no",
+      .default = "yes"
+    ),
+    
+    ## is there a break in the sequence of survey days - a day missed? will mess with stay durations
+    valid_svyday_sequence = case_when(
+      difftime(end_datetime, start_datetime, units = "days") > 1 ~ "no",
+      .default = "yes"
+    ),
+  ) |>
+  ungroup() |>
+  group_by(
+    activity_class,
+    activity_desc,
+    valid_stay_location,
+    valid_stay_trip_sequence,
+    valid_svyday_sequence
+  ) |>
+  mutate(
+    duration_pctile = quantile(activity_duration, 0.99),
+    valid_duration = case_when(activity_duration > duration_pctile ~ "no", .default = "yes")
+  ) |>
+  ungroup() |>
+  select(-duration_pctile)
+```
+
+# Make Tempograms
+
+```{r}
+activites_list <- episodes |> 
+  ungroup() |> 
+  distinct(activity_desc) |> 
+  pull(activity_desc) |> 
+  as.list()
+
+activites_short_names <- c(
+  "Initial Stay" = "Initial Stay",
+  "Transit" = "Transit",
+  "Work" = "Work",
+  "Walk" = "Walk",
+  "Home" = "Home",
+  "Restaurant (dine-in or take-out)" = "Restaurant",
+  "Friend/Family member’s house" = "Friend/Family",
+  "Last Stay" = "Last Stay",
+  "K-12 School or daycare" = "Education",
+  "Shopping" = "Shopping",
+  "Recreation/Entertainment/Exercise (e.g., movies, theater, park)" = "Recreation",
+  "Errands or personal business (e.g. bank, post office)" = "Errands",
+  "Other" = "Other",
+  "Car" = "Car",
+  "Work-related place (e.g., meeting, second job, delivery)" = "Work-related",
+  "Missing" = "Missing",
+  "Religious (e.g., church, synagogue)" = "Religious",
+  "Airport" = "Airport",
+  "Doctor/Medical Service/Hospital" = "Medical",
+  "College/University" = "University",
+  "Bicycle" = "Bicycle"
+)
+
+activites_short_names_summary <- c(
+  "Initial Stay" = "Initial Stay",
+  "Transit" = "Travel",
+  "Work" = "Work",
+  "Walk" = "Travel",
+  "Home" = "Home",
+  "Restaurant (dine-in or take-out)" = "Restaurant",
+  "Friend/Family member’s house" = "Social",
+  "Last Stay" = "Last Stay",
+  "K-12 School or daycare" = "Edu: K-12",
+  "Shopping" = "Shopping",
+  "Recreation/Entertainment/Exercise (e.g., movies, theater, park)" = "Recreation",
+  "Errands or personal business (e.g. bank, post office)" = "Errands",
+  "Other" = "Other",
+  "Car" = "Travel",
+  "Work-related place (e.g., meeting, second job, delivery)" = "Work",
+  "Missing" = "Missing",
+  "Religious (e.g., church, synagogue)" = "Religious",
+  "Airport" = "Travel",
+  "Doctor/Medical Service/Hospital" = "Errands",
+  "College/University" = "Edu: College",
+  "Bicycle" = "Travel"
+) |> 
+  enframe() |> 
+  deframe()
+```
+
+```{r}
+time_unit = 15
+
+activity_exclude_list <- c("Other", "Missing", "Initial Stay", "Last Stay")
+
+episodes_tempogram <- episodes |>
+  ungroup() |>
+  group_by(person_id, timeblock_id) |>
+  mutate(
+    start_datetime_r = round_date(start_datetime, paste0(15, " minutes")),
+    activity_duration_r = round(as.numeric(activity_duration) / 15) * 15,
+    duration_multiple = activity_duration_r / 15,
+  ) |>
+  collect() |>
+  ungroup() |>
+  tidyr::uncount(duration_multiple, .id = "uncount_n") |>
+  mutate(
+    activity_desc_sum = activites_short_names_summary[activity_desc],
+    activity_time = time_unit,
+    activity_time_w = per_weight * time_unit,
+    cum_time = time_unit * (uncount_n - 1),
+    cum_start_datetime = start_datetime_r + minutes(cum_time),
+  ) |>
+  filter(!activity_desc_sum %in% activity_exclude_list) |>
+  group_by(activity_desc_sum,
+           std_wday,
+           std_time = hms::as_hms(cum_start_datetime)) |>
+  summarize(
+    activity_time = sum(activity_time),
+    activity_time_w = sum(activity_time_w)
+  ) |>
+  ungroup() |>
+  mutate(std_wday = fct_relevel(std_wday, "weekday", "saturday", "sunday"), )
+```
+
+```{r}
+#| fig-height: 8
+#| fig-width: 8
+episodes_tempogram |>
+  ggplot(aes(x = std_time, y = activity_time_w, fill = activity_desc_sum, colour = activity_desc_sum)) +
+  geom_area(position = position_fill(), alpha = .8) +
+  scale_x_time(breaks = scales::date_breaks("3 hours")) +
+  scale_y_continuous(labels = scales::percent) +
+  facet_wrap(vars(std_wday), nrow = 3) +
+  theme_minimal() +
+  theme(
+    legend.position = "right",
+    axis.title.x = element_blank(),
+    axis.title.y = element_blank(),
+    legend.title = element_blank()
+  )
+```
+
+# Save 
+
+```{r}
+save(
+  episode_builder, 
+  episodes, 
+  episodes_tempogram, 
+  file = fs::path(output_path, "02_episodes.Rdata"))
+```

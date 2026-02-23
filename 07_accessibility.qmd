@@ -1,0 +1,406 @@
+---
+title: "08_accessibility"
+format: html
+---
+
+```{r}
+#| label: setup
+options(java.parameters = "-Xmx64G")
+
+library(tidyverse)
+library(patchwork)
+library(dtplyr)
+library(fs)
+library(sf)
+library(stars)
+library(terra)
+library(tmap)
+library(r5r)
+library(arrow)
+```
+
+# Setup
+
+```{r}
+output_path <- fs::dir_create("./output")
+load(file = fs::path(output_path, "01_data.Rdata"))
+load(file = fs::path(output_path, "03_st_paths.Rdata"))
+```
+
+## prepare study area grid
+
+```{r}
+cell_size = 100
+
+study_area_bbox <- boundaries_boroughs |> 
+  #filter(NAMELSAD == "New York County") |> 
+  #st_buffer(1000) |> 
+  st_bbox()
+
+study_area_boundaries <- boundaries_boroughs |> 
+  st_crop(study_area_bbox) |> 
+  st_collection_extract("POLYGON")
+
+study_area_raster <- boundaries_boroughs |>
+  select(geometry) |> 
+  st_rasterize(
+    template = st_as_stars(
+      study_area_bbox,
+      dx = cell_size,
+      dy = cell_size,
+      pretty = TRUE,
+      values = NA_real_))
+
+study_area_points <- study_area_raster |> 
+  st_xy2sfc(as_points = TRUE) |> 
+  st_as_sf() |> 
+  select(-ID) |> 
+  mutate(id = as.character(row_number()))
+
+study_area_polygons <- study_area_raster |> 
+  st_xy2sfc(as_points = FALSE) |> 
+  st_as_sf() |> 
+  select(-ID) |> 
+  st_join(study_area_points)
+```
+
+# Get Trip Paths
+
+## Get Flex Trips
+
+```{r}
+flex_activities <- c(
+  "Restaurant (dine-in or take-out)",
+  "Recreation/Entertainment/Exercise (e.g., movies, theater, park)",
+  "Shopping"
+)
+
+flex_trips <- st_paths |> 
+  drop_na(trip_id) |> 
+  filter(end_activity_type %in% flex_activities) |> 
+  sf::st_zm(drop = TRUE) |> 
+  mutate(
+    start_point = lwgeom::st_startpoint(geometry),
+    end_point = lwgeom::st_endpoint(geometry))
+
+trip_weights <- flex_trips |> 
+  st_drop_geometry() |> 
+  select(trip_id, trip_weight) |> 
+  mutate(trip_id = as.character(trip_id))
+```
+
+## calculate trip paths
+
+```{r}
+r5_path_forward <- dir_create("./r5_graph_forward")
+r5_graph_forward <- r5r::build_network(data_path = r5_path_forward)
+```
+
+```{r}
+trip_paths_path <- fs::dir_create("./trip_paths_flex")
+```
+
+```{r}
+#| eval: false
+
+trip_paths <- flex_trips |> 
+  filter(trip_mode != "OTHER") |>
+  #mutate(from_id = trip_id, to_id = trip_id) |>
+  # unify start_datetime for non-transit modes
+  mutate(
+    std_wday = case_when(
+      wday((start_datetime)) == 1 ~ "sunday",
+      wday((start_datetime)) == 7 ~ "saturday",
+      TRUE ~ "weekday")) |> 
+  filter(std_wday == "weekday") |> 
+  mutate(
+    #start_datetime = case_when(trip_mode != "TRANSIT" ~ NA, TRUE ~ start_datetime),
+    std_day = case_when(
+      # sunday
+      wday(start_datetime) == 1 ~ "2018-03-25",
+      # saturday
+      wday(start_datetime) == 7 ~ "2018-03-24",
+      # weekday
+      .default = "2018-03-23" 
+    ),
+    std_departure_datetime = case_when(
+      trip_mode == "TRANSIT" ~ ymd_hms(paste0(std_day, " ", hms::as_hms(start_datetime))), # keep original start time for transit with standard weekday
+      TRUE ~ ymd_hms(paste0(std_day, " 08:00:00")) # all other modes default to 8:00AM (doesn't matter for routing but helps batching)
+    ),
+    std_departure_datetime = round_date(std_departure_datetime, "5 minutes") # round to nearest 5 min for batching
+  ) |> 
+  group_by(trip_mode, std_departure_datetime) |> 
+  group_map(
+    ~ r5r::detailed_itineraries(
+      r5r_network = r5_graph_forward,
+      origins = .x |> select(id = trip_id, start_point) |> st_set_geometry("start_point") |> st_transform(crs = 4326),
+      destinations = .x |> select(id = trip_id, end_point) |> st_set_geometry("end_point") |> st_transform(crs = 4326),
+      mode = .y |> pull("trip_mode"),
+      departure_datetime = .y |> pull("std_departure_datetime")
+    ) |> 
+      add_column(.y)) |> 
+  bind_rows() |> 
+  st_transform(crs = 26918) |> 
+  left_join(trip_weights, by = c("from_id" = "trip_id")) 
+
+save(trip_paths, file = fs::path(trip_paths_path, "trip_paths.Rdata")) 
+```
+
+# Get Impedance Functions from Trip Paths
+
+```{r}
+#| label: load trip paths
+load(file = fs::path(trip_paths_path, "trip_paths.Rdata"))
+```
+
+```{r}
+flex_trips <- trip_paths |> 
+  st_drop_geometry() |> 
+  mutate(
+    std_wday = case_when(
+      wday((std_departure_datetime)) == 1 ~ "sunday",
+      wday((std_departure_datetime)) == 7 ~ "saturday",
+      TRUE ~ "weekday")) |> 
+  group_by(trip_id = from_id, trip_mode) |> 
+  summarize(count = n(),
+            trip_weight = first(trip_weight),
+            trip_duration = first(total_duration)) |> 
+  group_by(trip_mode) |> 
+  mutate(trip_weight_prop = trip_weight / sum(trip_weight)) |> 
+  ungroup()
+```
+
+Get CDFs by mode, using trip weights:
+
+```{r}
+modal_cdfs <- flex_trips |> 
+  group_by(trip_mode) |> 
+  nest() |> 
+  mutate(
+    pdf = map(data, 
+      ~ density(x = .x |>  pull("trip_duration"), 
+                weights = .x |>  pull("trip_weight_prop"),
+                from = 0, 
+                to = 180,
+                adjust = 2)),
+    cdf = map(pdf, 
+      ~spatstat.univar::CDF(f = .x))) |> 
+  select(trip_mode, cdf) |> 
+  deframe()
+
+impedance_cdf <- list(
+  BICYCLE = function(t_ij){1-modal_cdfs$BICYCLE(t_ij)},
+  CAR = function(t_ij){1-modal_cdfs$CAR(t_ij)},
+  TRANSIT = function(t_ij){1-modal_cdfs$TRANSIT(t_ij)},
+  WALK = function(t_ij){1-modal_cdfs$WALK(t_ij)}
+)
+
+modal_cdf_df <-
+  data.frame(t_ij = seq(from = 0, to = 120, by = 1)) %>%
+  mutate(across(t_ij, .fns = impedance_cdf, .names = "cdf_{fn}")) %>%
+  pivot_longer(
+    cols = starts_with("cdf"),
+    names_to = "trip_mode",
+    values_to = "impedance_weight",
+    names_prefix = "cdf_"
+  ) %>%
+  mutate(trip_mode = fct_relevel(
+    trip_mode,
+    "WALK", "BICYCLE", "TRANSIT", "CAR"))
+```
+
+Make plots:
+
+```{r}
+pdf_plot <- flex_trips |> 
+  #ggplot(aes(x = total_duration, colour = trip_mode)) + 
+  #geom_density(adjust = 2)
+  ggplot(aes(x = trip_duration,
+      colour = trip_mode,
+      #fill = trip_mode,
+      weight = trip_weight_prop)) +
+  geom_density(adjust = 2,
+               alpha = .1,
+               lwd = 1) +
+  viridis::scale_color_viridis(discrete = TRUE, option = "D", end = .97) +
+  #viridis::scale_fill_viridis(discrete = TRUE, begin = .2) +
+  scale_x_continuous(limits = c(0, 90), 
+                     breaks = seq(0, 90, by = 30)) +
+  ylab("probability density") +
+  theme_minimal() +
+  guides(fill="none", colour = "none") +
+  theme(axis.title.x=element_blank())
+
+cdf_plot <- ggplot(modal_cdf_df, 
+       aes(x = t_ij, 
+           y = impedance_weight, 
+           colour = trip_mode)) +
+  geom_line(size = 1) +
+  scale_x_continuous(limits = c(0, 90), 
+                     breaks = seq(0, 90, by = 30)) +
+  viridis::scale_color_viridis(discrete = TRUE, option = "D", end = .97) +
+  guides(color=guide_legend(title="trip mode")) +
+  xlab("travel time (minutes)") +    
+  ylab("1 - cumulative probability") + 
+  theme_minimal()
+
+pdf_cdf_plot <- pdf_plot / cdf_plot + 
+  plot_layout(guides = "collect") & 
+  theme(legend.position = "right")
+pdf_cdf_plot
+```
+
+# Get Opportunities by Cell
+
+```{r}
+overture_flexthemes <- c(
+  "active_life",
+  "arts_and_entertainment",
+  "attractions_and_activities",
+  "eat_and_drink",
+  "retail"
+)
+
+# count opportunities by cell
+nyc_places_flex <- nyc_places |> 
+  rename(poi_id = id) |> 
+  filter(theme_primary %in% overture_flexthemes) |> 
+  st_transform(crs = 26918) |> 
+  st_join(study_area_polygons) |>
+  drop_na(id) |> 
+  st_drop_geometry() |> 
+  group_by(id) |> 
+  summarize(opp_weight = n())
+
+# join back to study area points
+study_area_points <- study_area_points |> 
+  left_join(nyc_places_flex, by = "id") |> 
+  mutate(opp_weight = replace_na(opp_weight, 0)) |> 
+  st_join(census_bg_2010 |> select(block_group = BlockGroup_GEOID, county = COUNTYFP, geometry)) |> 
+  mutate(
+    block_group = replace_na(block_group, "9999"),
+    county = replace_na(county, "9999"))
+
+opportunities_raster <- study_area_points |> 
+  select(-id) |> 
+  filter(opp_weight > 0) |> 
+  st_as_stars() |> 
+  st_sfc2xy()
+```
+
+# Calculate Travel Time Matrix
+
+calculate ttm using BGs as origins, assume PM peak for weekday travel
+
+```{r}
+#| eval: false
+#| warning: false
+trip_mode <- c("walk", "bicycle", "transit", "car") 
+ttms_path <- fs::dir_create("./ttms_100m")
+  
+census_bg_2010_origins <- census_bg_2010 |>
+  select(id = BlockGroup_GEOID, county = COUNTYFP, total_popE, geometry) |> 
+  st_centroid()
+
+census_bg_2010_origins |> 
+  crossing(trip_mode) |>
+  st_as_sf() |> 
+  group_by(trip_mode, county) |>
+  group_walk(
+    ~ r5r::travel_time_matrix(
+      r5r_network = r5_graph_forward,
+      origins = .x |> st_transform(crs = 4326),
+      destinations = study_area_points |> st_transform(crs = 4326),
+      mode = .y |> pull(trip_mode),
+      departure_datetime = ymd_hms("2018-03-23 16:00:00"),
+      max_trip_duration = 90) |> 
+      add_column(.y) |>
+      left_join(study_area_points |> st_drop_geometry() |> select(id, opp_weight), by = c("to_id" = "id")) |> 
+      left_join(census_bg_2010_origins |> st_drop_geometry() |> select(id, total_popE), by = c("from_id" = "id")) |> 
+      group_by(trip_mode, county) |> 
+      arrow::write_dataset(ttms_path)
+  )
+```
+
+# Calculate Accessibility
+## Register impedance functions into {arrow}
+
+```{r}
+#| eval: true
+register_scalar_function(
+  name = "impedance_f_walk",
+  fun = function(context, t_ij) {impedance_cdf$WALK(t_ij)},
+  in_type = schema(t_ij = int32()),
+  out_type = float64(),
+  auto_convert = TRUE
+)
+
+register_scalar_function(
+  name = "impedance_f_bicycle",
+  fun = function(context, t_ij) {impedance_cdf$BICYCLE(t_ij)},
+  in_type = schema(t_ij = int32()),
+  out_type = float64(),
+  auto_convert = TRUE
+)
+
+register_scalar_function(
+  name = "impedance_f_transit",
+  fun = function(context, t_ij) {impedance_cdf$TRANSIT(t_ij)},
+  in_type = schema(t_ij = int32()),
+  out_type = float64(),
+  auto_convert = TRUE
+)
+
+register_scalar_function(
+  name = "impedance_f_car",
+  fun = function(context, t_ij) {impedance_cdf$CAR(t_ij)},
+  in_type = schema(t_ij = int32()),
+  out_type = float64(),
+  auto_convert = TRUE
+)
+```
+
+## Calculate Market Potential
+
+```{r}
+place_marketpotential_by_mode <- arrow::open_dataset("./ttms_100m") |>
+  mutate(
+    grav_weight = case_when(
+      trip_mode == "walk" ~ impedance_f_walk(travel_time_p50),
+      trip_mode == "bicycle" ~ impedance_f_bicycle(travel_time_p50),
+      trip_mode == "transit" ~ impedance_f_transit(travel_time_p50),
+      TRUE ~ impedance_f_car(travel_time_p50),
+    ),
+    grav_markpop = total_popE * grav_weight
+  ) |>
+  group_by(to_id, trip_mode) |>
+  summarize(grav_markpop = sum(grav_markpop)) |> 
+  collect()
+
+```
+
+Make into a {stars} object:
+
+```{r}
+place_marketpotential_by_mode_weekday_stars <- study_area_points |>
+  left_join(place_marketpotential_by_mode, by = c("id" = "to_id")) |>
+  drop_na(trip_mode) |>
+  mutate(
+    trip_mode = fct_relevel(trip_mode, "walk", "bicycle", "transit", "car")
+  ) |> 
+  sfc_as_cols() |>
+  st_drop_geometry() |>
+  st_as_stars(dims = c("x", "y", "trip_mode")) |>
+  st_set_crs(26918)
+```
+
+# Save
+
+```{r}
+save(
+  impedance_cdf,
+  pdf_cdf_plot,
+  place_marketpotential_by_mode_weekday_stars,
+  file = "./output/07_place_access.Rdata"
+)
+```

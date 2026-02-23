@@ -1,0 +1,426 @@
+---
+title: "05_stv_calculator"
+format: html
+---
+
+```{r}
+#| label: setup
+options(java.parameters = "-Xmx96G")
+
+library(tidyverse)
+library(dtplyr)
+library(fs)
+library(sf)
+library(stars)
+library(terra)
+library(tmap)
+library(r5r)
+
+output_path <- fs::dir_create("./output")
+
+load(file = fs::path(output_path, "01_data.Rdata"))
+load(file = fs::path(output_path, "03_st_paths.Rdata"))
+```
+
+# Get Flextime Segments from Space-time Paths
+## Filter Paths
+
+```{r}
+# get activities
+activites <- st_paths |> 
+  st_drop_geometry() |> 
+  group_by(activity_class, activity_desc) |> 
+  summarize(count = n())
+
+flex_activities <- c(
+  "Restaurant (dine-in or take-out)",
+  "Recreation/Entertainment/Exercise (e.g., movies, theater, park)",
+  "Shopping"
+)
+```
+
+```{r}
+# extract flexible activity episodes
+flex_segments <- st_paths |> 
+  #filter(person_id == 5101) |> 
+  group_by(person_id, timeblock_id) |> 
+  filter(
+    valid_stay_location != "no" & 
+      valid_stay_trip_sequence != "no" & 
+      valid_svyday_sequence != "no" &
+      valid_duration != "no") |> 
+  mutate(
+    # classify valid episode chains
+    valid_cones = case_when(
+      # is a flexible activity
+      activity_desc %in% flex_activities & 
+        # bounded by a trip to the activity that occurs immediately prior to the activity
+        # non-nyc will be omitted due to missing line segments in workbook 3
+        (!is.na(lag(trip_id)) & start_datetime == lag(end_datetime)) &
+        # bounded by a trip from the activity that occurs immediately after the activity
+        (!is.na(lead(trip_id)) & end_datetime == lead(start_datetime)) ~ "yes",
+      .default = "no"
+        )
+  ) |> 
+  
+  # keep only valid cases
+  filter(
+    valid_cones == "yes" |
+      # previous episode
+      (lag(valid_cones) == "yes") |
+      
+      # next episode
+      (lead(valid_cones) == "yes")
+    ) |> 
+  group_by(person_id) |> 
+  
+  # create an id for the flexible sequences
+  mutate(flexseq_id = cumsum(start_datetime != lag(end_datetime, default = first(end_datetime))) + 1) |> 
+  
+  # get geometry as a column from lines
+  mutate(
+    start_x =  sf::st_coordinates(lwgeom::st_startpoint(geometry))[,1],
+    start_y = sf::st_coordinates(lwgeom::st_startpoint(geometry))[,2],
+    end_x = sf::st_coordinates(lwgeom::st_endpoint(geometry))[,1],
+    end_y = sf::st_coordinates(lwgeom::st_endpoint(geometry))[,2]) |> 
+  st_drop_geometry() |>
+  
+  # summarize down to one row for each flex segment
+  group_by(person_id, timeblock_id, flexseq_id) |>
+  summarize(
+    num_episodes = n(),
+    start_activity_type = first(start_activity_type),
+    end_activity_type = last(end_activity_type),
+    start_trip_mode = first(trip_mode),
+    end_trip_mode = last(trip_mode),
+    start_datetime = first(start_datetime),
+    end_datetime = last(end_datetime),
+    time_window = sum(activity_duration),
+    per_weight = first(per_weight),
+    start_x = first(start_x),
+    start_y = first(start_y),
+    end_x = last(end_x),
+    end_y = last(end_y)
+  ) |> 
+  ungroup() |> 
+  tidyr::unite(col = "id", c(person_id, timeblock_id, flexseq_id))
+```
+
+# Routing
+
+```{r}
+r5_path_forward <- dir_create("./r5_graph_forward")
+r5_graph_forward <- r5r::build_network(data_path = r5_path_forward)
+
+r5_path_reverse <- fs::dir_create("./r5_graph_reverse")
+r5_graph_reverse <- r5r::build_network(data_path = r5_path_reverse)
+```
+
+## Get study area grid
+
+```{r}
+cell_size = 100
+
+study_area_bbox <- boundaries_boroughs |> 
+  #filter(NAMELSAD == "New York County") |> 
+  #st_buffer(1000) |> 
+  st_bbox()
+
+study_area_boundaries <- boundaries_boroughs |> 
+  st_crop(study_area_bbox) |> 
+  st_collection_extract("POLYGON")
+
+study_area_raster <- boundaries_boroughs |>
+  select(geometry) |> 
+  st_rasterize(
+    template = st_as_stars(
+      study_area_bbox,
+      dx = cell_size,
+      dy = cell_size,
+      pretty = TRUE,
+      values = NA_real_))
+
+study_area_points <- study_area_raster |> 
+  st_xy2sfc(as_points = TRUE) |> 
+  st_as_sf() |> 
+  select(-ID) |> 
+  mutate(id = as.character(row_number()))
+
+study_area_polygons <- study_area_raster |> 
+  st_xy2sfc(as_points = FALSE) |> 
+  st_as_sf() |> 
+  select(-ID) |> 
+  st_join(study_area_points)
+```
+
+## Get Opportunities in Intervening Grid Cells
+
+```{r}
+overture_flexthemes <- c(
+  "active_life",
+  "arts_and_entertainment",
+  "attractions_and_activities",
+  "eat_and_drink",
+  "retail"
+)
+
+# count opportunities by cell
+nyc_places_flex <- nyc_places |> 
+  rename(poi_id = id) |> 
+  filter(theme_primary %in% overture_flexthemes) |> 
+  st_transform(crs = 26918) |> 
+  st_join(study_area_polygons) |>
+  drop_na(id) |> 
+  st_drop_geometry() |> 
+  group_by(id) |> 
+  summarize(opp_weight = n())
+
+# join back to study area points
+study_area_points <- study_area_points |> 
+  left_join(nyc_places_flex, by = "id") |> 
+  mutate(opp_weight = replace_na(opp_weight, 0))
+
+opportunities_raster <- study_area_points |> 
+  select(-id) |> 
+  filter(opp_weight > 0) |> 
+  st_as_stars() |> 
+  st_sfc2xy()
+```
+
+```{r}
+#| eval: false
+tm_shape(opportunities_raster) + 
+  tm_raster(
+    col = "opp_weight",
+    col.free = TRUE,
+    col.scale =
+      #tm_scale_continuous(
+      #  values = "viridis",
+      #  label.format = list(digits = 0, big.num.abbr = c("mln" = 6, "K" = 3))
+      #),
+      tm_scale_intervals(
+        style = "fisher",
+        n = 5,
+        label.format = list(digits = 0, big.num.abbr = c("mln" = 6, "K" = 3)),
+        values = "viridis"
+      ),
+    col.legend = tm_legend(
+      height = 8,
+      title = ""
+      )
+  ) +
+  tm_shape(boundaries_boroughs) + tm_fill(fill = "grey95", zindex = 1) +
+  tm_shape(boundaries_base) + tm_fill(fill = "grey95", zindex = 2) +
+  #tm_facets_flip() +
+  tm_layout(
+    bg.color = "grey75",
+    legend.bg.color = NA,
+    legend.bg.alpha = 0,
+    legend.position = c("left", "top"),
+    #legend.text.color = "white",
+    #frame = FALSE,
+    #frame.lwd = 0,
+    #legend.frame = FALSE,
+    panel.label.frame = FALSE,
+    #panel.label.frame.lwd = NA,
+    panel.label.bg.color = NA
+  )
+```
+
+## Define Time Reversal Function
+
+```{r}
+#| label: define reverse time and datetime functions
+# define reverse time function
+reverse_time <- function(forward_time){
+  hh_rev = str_pad(abs(hour(forward_time) - 23), width = 2, side = "left", pad = "0")
+  mm_rev = str_pad(abs(minute(forward_time) - 59), width = 2, side = "left", pad = "0")
+  ss_rev = str_pad(abs(second(forward_time) - 59), width = 2, side = "left", pad = "0")
+  time_rev = paste(hh_rev, mm_rev, ss_rev, sep = ":")
+  return(time_rev)
+}
+
+# define reverse datetime function
+reverse_datetime <- function(forward_datetime) {
+  forward_date = as_date(forward_datetime)
+  time_rev = reverse_time(forward_datetime)
+  datetime_rev = ymd_hms(paste(forward_date, time_rev, sep = " "))
+  return(datetime_rev)
+}
+```
+
+## Define STV Calculator
+
+```{r}
+stv_calculator <- function(data, group_keys, intermediate_points, time_unit, output_path) {
+  
+  # get key parameters
+  id = group_keys |> pull(id)
+  start_trip_mode = data |> pull(start_trip_mode)
+  end_trip_mode = data |> pull(end_trip_mode)
+  time_window = data |> 
+    mutate(time_window = as.numeric(time_window)) |> 
+    pull(time_window)
+  per_weight = data |> pull(per_weight)
+  start_datetime = data |> pull(start_datetime)
+  end_datetime = data |> pull(end_datetime)
+  end_datetime_rev = end_datetime |> reverse_datetime()
+  
+  # forward cone
+  origins_i = data |> 
+    mutate(id = id) |> 
+    st_as_sf(coords = c("start_x", "start_y"), crs = 26918) |>
+    st_transform(crs = 4326) |> 
+    select(id, geometry)
+  
+  intermediate_points_wgs1984 = intermediate_points |>
+    st_transform(crs = 4326)
+  
+  tt_ij = r5r::travel_time_matrix(
+    r5r_network = r5_graph_forward, 
+    origins = origins_i,
+    destinations = intermediate_points_wgs1984,
+    mode = start_trip_mode,
+    departure_datetime = start_datetime,
+    max_trip_duration = time_window) |> 
+    rename(
+      travel_time_fwd = travel_time_p50,
+      i_id = from_id,
+      j_id = to_id)
+  
+  # reverse cone
+  destinations_k = data |> 
+    mutate(id = id) |> 
+    st_as_sf(coords = c("end_x", "end_y"), crs = 26918) |>
+    st_transform(crs = 4326) |> 
+    select(id, geometry)
+  
+  tt_jk = r5r::travel_time_matrix(
+    r5r_network = r5_graph_reverse, 
+    origins = destinations_k,
+    destinations = intermediate_points_wgs1984, # |> filter(id %in% unique_j_ids),
+    mode = end_trip_mode,
+    departure_datetime = end_datetime_rev,
+    max_trip_duration = time_window) |> 
+    rename(
+      travel_time_rev = travel_time_p50,
+      j_id = to_id,
+      k_id = from_id)
+  
+  # prepare voxels
+  tryCatch(
+    intermediate_points |>
+      # add geometry columns and drop sfc
+      sfc_as_cols() |>
+      st_drop_geometry() |>
+      
+      # send to dt for processing
+      dtplyr::lazy_dt() |> 
+      
+      # get intermediate cell j id
+      rename(j_id = id) |>
+      
+      # join travel times from i and to k
+      left_join(tt_ij, by = "j_id") |>
+      left_join(tt_jk, by = "j_id") |>
+      drop_na(travel_time_rev, travel_time_fwd) |>
+      
+      # get potential dwell time as time left in window after travel time
+      mutate(total_dwell_time = time_window - (travel_time_fwd + travel_time_rev)) |>
+      
+      # filter out negative dwell times where travel times exceed the time window
+      filter(total_dwell_time > 0) |>
+      
+      # get attributes and the voxel multiple
+      mutate(
+        # round dwell time to the nearest time unit increment
+        total_dwell_time_r = round(total_dwell_time / time_unit) * time_unit,
+        
+        # get voxel multiple to uncount rows over the time dimension
+        voxel_multiple = total_dwell_time_r / time_unit,
+        
+        # get the start datetime for dwell time within each voxel
+        vox_start_datetime = start_datetime + minutes(travel_time_fwd)
+      ) |>
+      
+      # uncount to create voxel rows over the time dimension
+      dtplyr_uncount(voxel_multiple, .id = "uncount_n") |>
+      
+      # get voxel dwell time and z attribute
+      mutate(
+        # forward and reverse cone trip modes
+        fc_trip_mode = start_trip_mode,
+        rc_trip_mode = end_trip_mode,
+        # person weights
+        per_weight = per_weight,
+        # individual voxel dwell time
+        dwell_time = time_unit,
+        # time dimension coordinate t for the voxel
+        t = round_date(
+          vox_start_datetime + minutes(dwell_time * (uncount_n - 1)), 
+          paste0(time_unit, " minutes"))
+      ) |>
+      
+      # clean up
+      select(
+        i_id,
+        fc_trip_mode, rc_trip_mode,
+        opp_weight, per_weight,
+        dwell_time,
+        x, y, t
+      ) |>
+      
+      # rebuild the id for each stv to get the person id out (we will use the person id to help write the dataset below)
+      separate(col = i_id, into = c("person_id", "timeblock_id", "flexseq_id"), sep = "_") |> 
+      # re-organize individual stv ids around sequence IDs
+      unite(col = "seq_id", c("timeblock_id", "flexseq_id"), sep = "_") |> 
+      
+      # execute
+      collect() |> 
+      
+      # write to dataset
+      select(-uncount_n) |> 
+      group_by(fc_trip_mode, person_id, seq_id) |>
+      arrow::write_dataset(path = output_path),
+    
+    error = function(e) {
+      message(paste0("An error occurred for id=", id, ":\n", e))
+    },
+    warning = function(w) {
+      message(paste0("A warning occurred for id=", id, ":\n", w))
+    },
+    finally = {
+      message(paste0("Done id=", id))
+    }
+  )
+}
+```
+
+# Run Space-time Voxel Calculations
+
+Takes about 40 hours on an 18 core / 36 thread Xeon processor and seems to require about 40gb of memory
+
+```{r}
+stv_flex_path <- fs::dir_create("./stvs_flex_100m")
+time_unit = 5
+
+tictoc::tic()
+flex_segments |> 
+  drop_na() |>  
+  filter(start_trip_mode != "OTHER" & end_trip_mode != "OTHER") |> 
+  group_by(id) |> 
+  group_walk(~ stv_calculator(
+    data = .x, 
+    group_keys = .y, 
+    intermediate_points = study_area_points,
+    time_unit = time_unit, # minutes
+    output_path = stv_flex_path))
+  
+tictoc::toc()
+```
+
+# Save
+
+```{r}
+save(flex_segments, stv_calculator, file = "./output/05_stv_calculator.Rdata")
+```

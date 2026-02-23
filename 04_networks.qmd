@@ -1,0 +1,323 @@
+---
+title: "04_networks"
+format: html
+---
+
+# Setup
+
+```{r}
+#| label: setup
+options(java.parameters = "-Xmx64G")
+
+library(tidyverse)
+library(fs)
+library(sf)
+library(tmap)
+
+library(r5r)
+library(tidytransit)
+
+library(furrr)
+plan(multisession, workers = parallel::detectCores() - 2)
+```
+
+```{r}
+# create data directories
+cache_path <- dir_create("./cache")
+
+data_path <- dir_create("./data")
+
+elevation_path <- fs::dir_create(fs::path(data_path, "elevation_15m"))
+osm_data_path <- fs::dir_create(data_path, "osm")
+gtfs_2018_path <- fs::dir_create(fs::path(data_path, "gtfs_2018"))
+```
+
+# Download Data
+
+# Get GTFS Files
+
+Downloading current and historical GTFS files for different transit providers from [Transitland](https://www.transit.land). See [here](https://www.interline.io/transitland/plans-pricing/) for more information on how to obtain a key. Transitland's basic free tier allows for the downloading of current feed versions, while a separate hobbyist/academic free tier enables a user to download historical feeds.
+
+```{r}
+transit_land_api_key <- "your_key_here"
+```
+
+## GTFS for Spring 2018
+
+The MTA Travel Survey downloaded below was fielded from March-June 2018. To calculate trip flows on the network, the code below obtains GTFS files that cover this time period:
+
+```{r}
+#| label: get gtfs for 2018
+#| eval: false
+
+gtfs_2018_list <- c(
+  "nyct_subway" = "174e58c5a32eb4404b0358ce8dbf179dfe914572",
+  
+  "nyct_bus_bronx_1" = "7dbe46daa61f9a996476649e6a141ec306dd4796",
+  "nyct_bus_bronx_2" = "e4be1ad7a2372b25c1c6ec6f294e359d985849ed",
+  
+  "nyct_bus_manhattan_1" = "1da101485fa5bab9e8d504c898485e114a1eb5d6",
+  "nyct_bus_manhattan_2" = "339d3b2ff1a2a17495d0f36f478e82a3cc2fe720",
+  
+  "nyct_bus_brooklyn_1" = "c31801687408edecdd2b42a86378340e5fdfb14f",
+  "nyct_bus_brooklyn_2" = "f458cf2e9c3dbd698f8cc1c1ea4db664a11cb6b4",
+  
+  "nyct_bus_staten_1" = "b8ea7709196b1445f5b07114abeb1b3ff1bc369e",
+  "nyct_bus_staten_2" = "50735207cf3b244b6158cb38b7530d82a8ba6b4e",
+  
+  "nyct_bus_queens_1" = "f9d88f3d17844b4c2cbd10e5e47574c698eecaa7",
+  "nyct_bus_queens_2" = "246bad93b71de78b0e789327d7a74e201843ea90",
+  
+  "nyc_busco_1" = "2010595e7244adf85c81c9ee6e3f2c4445e2aca1",
+  "nyc_busco_2" = "a6dc342ba045f320e4e98aaec6fc5ee57a046fdf",
+  
+  "si_ferry" = "55cb4f102021db7ab4ffd74b8a734e9c386cf544",
+  "nyc_ferry" = "dbc75610cfd814d5bd61edafbf442c1d5d990458"
+)
+
+purrr::iwalk(
+  gtfs_2018_list, 
+  ~ httr2::req_perform(
+      req = httr2::request(paste0("https://transit.land/api/v2/rest/feed_versions/", .x, "/download?apikey=", transit_land_api_key)) |> 
+        httr2::req_cache(path = cache_path),
+      path = fs::path(gtfs_2018_path, paste0(.y, ".zip")))
+  )
+```
+
+Unfortunately, the Staten Island Ferry GTFS file has an error: the required `route_short_name` column is named `short_name` in the `routes.txt` file. The code below unzips the archive, reads in the file, renames the column, writes it back out, deletes the old archive, and makes a new `.zip` with the fixed file:
+
+```{r}
+#| label: fix si_ferry gtfs
+#| message: false
+#| eval: false
+
+# unzip staten island ferry gtfs
+zip::unzip(
+  zipfile = fs::path(gtfs_2018_path, "si_ferry.zip"),
+  exdir = fs::path(gtfs_2018_path, "si_ferry"))
+
+# read in routes, change name, and rewrite to txt
+read_delim(
+    file = fs::path(gtfs_2018_path, "si_ferry", "routes.txt"),
+    delim = ",") |> 
+  rename(route_short_name = short_name) |> 
+  write_delim( 
+    file = fs::path(gtfs_2018_path, "si_ferry", "routes.txt"), 
+    delim = ",")
+
+# delete old zip
+fs::file_delete(fs::path(gtfs_2018_path, "si_ferry.zip"))
+
+# make new zip
+zip::zip(
+  zipfile = fs::path(gtfs_2018_path, "si_ferry.zip"), 
+  files = fs::dir_ls(fs::path(gtfs_2018_path, "si_ferry")),
+  mode = "cherry-pick")
+
+# delete working folder
+fs::file_delete(fs::path(gtfs_2018_path, "si_ferry"))
+```
+
+# Get OSM Data
+
+Next, we will get data from OpenStreetMap for the New York City metro region using the {osmextract} [@gilardi2022] package. The `openstreetmap_fr` provider has an extract for New York City:
+
+```{r}
+#| label: check osmextract for nyc
+osmextract::oe_match("new york city", provider = "openstreetmap_fr")
+```
+
+This data can then be downloaded using the code below. However, this downloads the most current version of the extract. Because there is no easy way to download historic OSM data, an OSM extract from November 2023 that aligns with the GTFS data is stored in the `data/osm_2023` folder.
+
+```{r}
+#| label: get osm for nyc
+#| eval: false
+osmextract::oe_get(
+  place = "new york city", provider = "openstreetmap_fr",
+  download_directory = osm_data_path,
+  download_only = TRUE,
+  skip_vectortranslate = TRUE
+)
+```
+
+# Get Elevation Data
+
+An elevation raster for the study area can be downloaded using the {elevatr} package. In this case, we will make use of the elevation tiles from Amazon Web Service (AWS) at around a 15m raster resolution, clipped to the bounding box that contains the `boundaries_boroughs`:
+
+```{r}
+#| label: get elevation raster from AWS
+#| message: false
+#| eval: false
+
+elevation_raster <- 
+  elevatr::get_elev_raster(
+    locations = boundaries_boroughs, 
+    z = 12, # 13 = about 7m; 12 = about 15m
+    src = "aws", 
+    clip = "bbox", 
+    expand = 1000) |> 
+  
+  # convert to a terra raster
+  terra::rast()
+```
+
+```{r}
+#| label: save raster as tif
+#| eval: false
+
+terra::writeRaster(
+  x = elevation_raster,
+  filename = fs::path(elevation_path, "nyc_elevation_15m.tif"),
+  overwrite = TRUE)
+```
+
+# Forward Network
+
+```{r}
+#| label: copy r5 inputs for forward time network
+#| eval: false
+
+r5_path_forward <- dir_create("./r5_graph_forward") # for the r5 network graph in forward time direction
+
+r5_forward_inputs_list <- c(
+  fs::path(osm_data_path, "openstreetmap_fr_new_york_city-latest.osm.pbf"),
+  fs::dir_ls(gtfs_2018_path, regexp = "*.zip"),
+  fs::path(elevation_path, "nyc_elevation_15m.tif")
+)
+
+file_copy(
+  path = r5_forward_inputs_list,
+  new_path = r5_path_forward,
+  overwrite = TRUE
+)
+```
+
+## Build Network
+
+```{r}
+#| eval: false
+r5_graph_forward <- r5r::setup_r5(data_path = r5_path_forward)
+```
+
+# Reverse Transit Network
+## Copy Street Network and Elevation
+
+```{r}
+#| label: copy r5 inputs for reverse time network
+r5_path_reverse <- fs::dir_create("./r5_graph_reverse") # for the r5 network graph in reverse time direction
+
+r5_reverse_inputs_list <- c(
+  fs::path(osm_data_path, "openstreetmap_fr_new_york_city-latest.osm.pbf"),
+  fs::path(elevation_path, "nyc_elevation_15m.tif")
+)
+
+file_copy(
+  path = r5_reverse_inputs_list,
+  new_path = r5_path_reverse,
+  overwrite = TRUE
+)
+```
+
+## Get GTFS Files and Reverse Time
+### Define Time Reversal Function
+
+```{r}
+#| label: define reverse time and datetime functions
+# define reverse time function
+reverse_time <- function(forward_time){
+  hh_rev = str_pad(abs(hour(forward_time) - 23), width = 2, side = "left", pad = "0")
+  mm_rev = str_pad(abs(minute(forward_time) - 59), width = 2, side = "left", pad = "0")
+  ss_rev = str_pad(abs(second(forward_time) - 59), width = 2, side = "left", pad = "0")
+  time_rev = paste(hh_rev, mm_rev, ss_rev, sep = ":")
+  return(time_rev)
+}
+
+# define reverse datetime function
+reverse_datetime <- function(forward_datetime){
+  forward_date = as_date(forward_datetime)
+  time_rev = reverse_time(forward_datetime)
+  datetime_rev = ymd_hms(paste(forward_date, time_rev, sep = " "))
+  return(datetime_rev)
+}
+```
+
+### Define GTFS Time Reversal Function
+
+```{r}
+#| label: define gtfs reverse time function
+gtfs_reverse_time <- function(gtfs_zip, gtfs_work_folder, output_folder){
+  z_fullname = fs::path_file(gtfs_zip)
+  z_name = fs::path_ext_remove(z_fullname)
+  z_path = fs::path_dir(gtfs_zip)
+  z_out_fullname = paste0(z_name, "_rev.zip")
+  
+  work_path = fs::dir_create(fs::path(gtfs_work_folder, z_name))
+  #z_tmp_dir <- tempdir()
+  
+  # unzip gtfs folder
+  zip::unzip(zipfile = gtfs_zip, exdir = work_path)
+  
+  # read stop_times
+  stop_times = readr::read_delim(file = fs::path(work_path, "stop_times.txt"), col_types = cols(.default = "c")) |> 
+    
+    # reverse stop times
+    mutate(arrival_time_rev = reverse_time(lubridate::hms(arrival_time)),
+           departure_time_rev = reverse_time(lubridate::hms(departure_time))) |> 
+    
+    # reverse stop sequence and re-sort
+    group_by(trip_id) |> 
+    mutate(stop_sequence_rev = abs(as.numeric(stop_sequence) - (max(as.numeric(stop_sequence)))-1)) |> 
+    arrange(stop_sequence_rev, .by_group = TRUE) |> 
+    ungroup() |> 
+    
+    # finish up
+    mutate(arrival_time = departure_time_rev,
+           departure_time = arrival_time_rev,
+           stop_sequence = stop_sequence_rev) |>
+    dplyr::select(-arrival_time_rev, -departure_time_rev, -stop_sequence_rev)
+  
+  # reverse stop sequence for shapes
+  shapes = readr::read_delim(file = fs::path(work_path, "shapes.txt"), col_types = cols(.default = "c")) |>
+    group_by(shape_id) |>
+    mutate(shape_pt_sequence_rev = abs(as.numeric(shape_pt_sequence) - (max(as.numeric(shape_pt_sequence))))) |>
+    arrange(shape_pt_sequence_rev, .by_group = TRUE) |>
+    ungroup() |>
+  
+    # finish up
+    mutate(shape_pt_sequence = shape_pt_sequence_rev) |>
+    dplyr::select(-shape_pt_sequence_rev)
+  
+  # write output
+  write_delim(stop_times, file = file.path(work_path, "stop_times.txt"), na = "", delim = ",")
+  write_delim(shapes, file = file.path(work_path, "shapes.txt"), na = "", delim = ",")
+  
+  # create new zip
+  zip::zip(zipfile = path(output_folder, z_out_fullname), 
+           files = dir_ls(work_path), 
+           mode = "cherry-pick")
+}
+```
+
+```{r}
+gtfs_work_path <- fs::dir_create("./gtfs_work_folder")
+
+# get a list of gtfs zip files in the gtfs directory
+gtfs_zip_list <- dir_ls(r5_path_forward, regexp = "*.zip")
+
+# reverse time in the gtfs files and send them to the reverse time network folder
+furrr::future_walk(
+  gtfs_zip_list,
+  ~ gtfs_reverse_time(
+    gtfs_zip = .x,
+    gtfs_work_folder = gtfs_work_path,
+    output_folder = r5_path_reverse
+  )
+)
+```
+
+## Build Network
+
+```{r}
+#| eval: false
+r5_graph_reverse <- setup_r5(data_path = r5_path_reverse, verbose = FALSE)
+```

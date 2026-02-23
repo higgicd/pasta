@@ -1,0 +1,615 @@
+---
+title: "01_data"
+format: html
+---
+y
+# Setup
+
+## Load Packages
+
+```{r}
+#| label: load packages
+#| message: false
+# load packages
+## tidyverse
+library(tidyverse)
+library(fs)
+library(httr2)
+library(readxl)
+library(zip)
+
+## census
+library(tidycensus)
+library(tigris)
+library(lehdr)
+
+## spatial
+library(sf)
+library(tmap)
+library(osmextract)
+library(rosmium)
+library(elevatr)
+
+# create file path helpers
+data_path <- dir_create("./data")
+cache_path <- dir_create("./cache")
+
+# set cache for tigris shapefiles
+options(tigris_use_cache = TRUE)
+tigris_cache_dir(cache_path)
+```
+
+## Set up Java Environment
+
+```{r}
+#| label: install_java
+#| eval: false
+rJavaEnv::java_quick_install(version = 21)
+```
+
+```{r}
+#| label: check_java
+rJavaEnv::java_check_version_rjava()
+```
+
+## Set Up API Keys
+
+```{r}
+#| label: setup api keys
+tidycensus::census_api_key("your_key_here")
+```
+
+API Key is needed for downloading data from the US Census using {tidycensus}; see [here](https://walker-data.com/tidycensus/articles/basic-usage.html) for instructions on how to obtain an API key from the US Census Bureau.
+
+# Define Helper Functions
+
+Define some functions that we will use throughout the project
+
+## Define `uncount` for {dtplyr}
+
+Code below relies on `uncount()` from {tidyr}, which is not yet implemented in the {dtplyr} package. However, there is a workaround here: https://github.com/tidyverse/dtplyr/issues/352
+
+```{r}
+dtplyr_uncount <- function(data, weights, ..., .remove = TRUE, .id = NULL) {
+  weights <- rlang::quo_squash(rlang::enquo(weights))
+  
+  groups <- group_vars(data)
+  has_groups <- length(groups) > 0
+  if (has_groups) {
+    data <- ungroup(data)
+  }
+
+  vars_names <- data$vars
+  if (.remove) {
+    vars_names <- setdiff(vars_names, rlang::as_name(weights))
+  }
+  vars <- map(syms(vars_names), ~ expr(rep(!!.x, !!weights)))
+  names(vars) <- vars_names
+  
+  if (!is.null(.id)) {
+    vars <- append(vars, rlang::exprs(!!.id := sequence(!!weights)))
+  }
+
+  out <- dtplyr:::step_subset_j(
+    data,
+    vars = vars_names,
+    j = rlang::call2(".", !!!vars)
+  )
+  
+  if (has_groups) {
+    out <- group_by(out, !!!syms(groups))
+  }
+  
+  out
+}
+```
+
+### Define ``sfc_as_cols` helper
+
+A nice one for getting the coordinates as columns based on https://github.com/r-spatial/sf/issues/231
+
+```{r}
+sfc_as_cols <- function(x, geometry, names = c("x","y")) {
+  if (missing(geometry)) {
+    geometry <- sf::st_geometry(x)
+  } else {
+    geometry <- rlang::eval_tidy(enquo(geometry), x)
+  }
+  stopifnot(inherits(x,"sf") && inherits(geometry,"sfc_POINT"))
+  ret <- sf::st_coordinates(geometry)
+  ret <- tibble::as_tibble(ret)
+  stopifnot(length(names) == ncol(ret))
+  x <- x[ , !names(x) %in% names]
+  ret <- setNames(ret,names)
+  dplyr::bind_cols(x,ret)
+}
+```
+
+# Get Census Data
+
+First, let's get population counts at the census block group level from the 2020 Decennial Census using {tidycensus}. The code below downloads the census data, does some light cleaning by removing the water areas, and transforms it to a projected coordinate system. New York City lies within UTM Zone 18N of the North American Datum 1983 (NAD 1983) and this projection can be called through [EPSG Code:26918](https://epsg.io/26918).
+
+## County-level Boundaries
+
+### NYC Boroughs
+
+NYC made up of five counties:
+
+-   Bronx County/The Bronx (`005`)
+-   Kings County/Brooklyn (`047`)
+-   New York County/Manhattan (`061`)
+-   Queens County/Queens (`081`)
+-   Richmond County/Staten Island (`085`)
+
+```{r}
+#| label: define counties list
+nyc_counties <- c(
+  "061", "005", "047", "081", "085"
+)
+```
+
+We can get their boundaries:
+
+```{r}
+#| label: get borough boundaries from acs
+#| message: false
+boundaries_boroughs <- tidycensus::get_acs(
+  geography = "county",
+  variables = c(total_pop = "B01001_001"),
+  year = 2022,
+  state = c("36"),
+  county = nyc_counties,
+  geometry = TRUE,
+  keep_geo_vars = TRUE) |> 
+  
+  # project to NAD83 Zone 18N
+  sf::st_transform(26918) |> 
+  
+  # erase water
+  tigris::erase_water(area_threshold = 0.85, year = 2022)
+```
+
+We can now take a look at the boroughs by making a quick map with {tmap} (@fig-boundaries_boroughs):
+
+```{r}
+#| label: fig-boundaries_boroughs
+#| fig-cap: The Five Boroughs of New York City
+
+tm_shape(boundaries_boroughs) +
+  tm_fill(
+    col = "NAMELSAD",
+    palette = "viridis",
+    title = "The Five Boroughs \nof NYC"
+  )
+```
+
+### Surrounding County Boundaries
+
+The resulting map of the boroughs could use some surrounding counties to help with figure-ground separation. This code gets boundaries for some surrounding counties in New York, New Jersey, and Connecticut:
+
+```{r}
+#| label: get county boundaries
+#| message: false
+# get county boundaries
+boundaries_base <- bind_rows(
+  tidycensus::get_acs(
+    geography = "county", 
+    variables = c(total_pop = "B01001_001"),
+    year = 2022,
+    state = c("34"),
+    county = c(003, 017, 013, 039, 023, 031), #025
+    geometry = TRUE,
+    cb = FALSE,
+    keep_geo_vars = TRUE),
+  
+  tidycensus::get_acs(
+    geography = "county", 
+    variables = c(total_pop = "B01001_001"),
+    year = 2022,
+    state = c("36"),
+    county = c(119, 059, 087),
+    geometry = TRUE,
+    cb = FALSE,
+    keep_geo_vars = TRUE),
+  
+  tidycensus::get_acs(
+    geography = "county", 
+    variables = c(total_pop = "B01001_001"),
+    year = 2022,
+    state = c("09"),
+    county = c(190),
+    geometry = TRUE,
+    cb = FALSE,
+    keep_geo_vars = TRUE)
+  ) |>
+  
+  # filter out water shapes
+  filter(ALAND > 0) |>
+  
+  # project
+  sf::st_transform(26918) |>
+  
+  # erase water area
+  tigris::erase_water(area_threshold = 0.75, year = 2022)
+```
+
+We can see the improved result in @fig-boundaries_boroughs_with_base:
+
+```{r}
+#| label: fig-boundaries_boroughs_with_base
+#| fig-cap: The Five Boroughs of New York City
+
+tm_shape(boundaries_boroughs) +
+  tm_fill(
+    col = "NAMELSAD",
+    palette = "viridis",
+    title = "The Five Boroughs \nof NYC"
+  ) +
+  tm_shape(boundaries_base) + tm_fill(col = "grey95")
+```
+
+## Block-group Level
+
+```{r}
+#| label: get acs bg data with 2010 boundaries
+#| message: false
+
+census_bg_2010 <- tidycensus::get_acs(
+  geography = "block group",
+  variables = c(total_pop = "B01001_001"),
+  state = "36",
+  county = nyc_counties,
+  year = 2019,
+  output = "wide",
+  geometry = TRUE,
+  keep_geo_vars = TRUE
+  ) |> 
+  
+  # rename the geoid to reflect the block group aggregation
+  rename(BlockGroup_GEOID = GEOID) |>
+  mutate(BlockGroup_GEOID = as.character(BlockGroup_GEOID)) |>
+  
+  # filter out water shapes
+  filter(ALAND > 0) |>
+  
+  # project to NAD83 Zone 18N
+  sf::st_transform(26918) |>
+  
+  # calculate area and set units to km^2
+  mutate(bg_area_m2 = st_area(geometry),
+         bg_area_km2 = units::set_units(bg_area_m2, km^2))
+
+# get list of bg ids for filtering travel survey
+census_bg_2010_id_list <- census_bg_2010 |> 
+  distinct(BlockGroup_GEOID) |> 
+  pull(BlockGroup_GEOID) |> 
+  as.list()
+```
+
+We can now take a look at the population data by making a quick density map using {tmap}:
+
+```{r}
+#| label: fig-bg_population_density
+#| fig-cap: Block Group-level Population Density
+tm_shape(census_bg_2010) +
+  tm_fill(
+    col = "total_popE",
+    area = "bg_area_km2",
+    style = "fisher",
+    palette = "viridis",
+    title = expression("People per km"^2)
+  ) +
+  tm_shape(boundaries_base) + tm_fill(col = "grey95")
+```
+
+# Get MTA Travel Survey
+
+The travel data comes from the Metropolitan Transportation Authority's (MTA) 2018 Travel Survey for New York City. For the purposes of this book, we will download linked trips and the person file:
+
+```{r}
+#| label: get mta travel survey
+#| warning: false
+travel_survey_path <- fs::dir_create("./data/travel_survey")
+
+travel_survey_list <- c(
+  "Linked" = "https://new.mta.info/document/29021",
+  "Person" = "https://new.mta.info/document/29011",
+  "Household" = "https://new.mta.info/document/29006"
+)
+
+purrr::iwalk(
+  travel_survey_list, 
+  ~ httr2::req_perform(
+      req = httr2::request(.x) |> 
+        httr2::req_cache(path = cache_path),
+      path = fs::path(travel_survey_path, paste0(.y, ".xlsx")))
+  )
+
+nycts_2018_linked <- readxl::read_xlsx(
+  path = fs::path(travel_survey_path, "Linked.xlsx"),
+  guess_max = 3000)
+
+nycts_2018_person <- readxl::read_xlsx(
+  fs::path(travel_survey_path, "Person.xlsx"))
+```
+
+## Prepare Linked Trips
+
+```{r}
+#| label: prepare linked trips
+# classify trip modes
+car_mode_list <- c(
+  "Auto Driver/Passenger",
+  "Taxi, Car/Van Service",
+  "TNC (Uber/Lyft)"
+)
+
+transit_mode_list <- c(
+  "NY or MTA Bus (no subway)",
+  "NYC Subway + Bus",
+  "NYC Subway Only"
+)
+
+# prepare data
+nycts_2018_linked <- nycts_2018_linked |> 
+  # select variables of interest
+  select(
+    hh_id = hhid,
+    person_id = personid,
+    day_num = daynum,
+    trip_num = tripnum,
+    trip_id = tripid,
+    trip_purpose = purpose,
+    hh_group,
+    hh_income,
+    gender,
+    age,
+    education_level,
+    driv_license = license,
+    disability,
+    start_lon,
+    start_lat,
+    stop_lon,
+    stop_lat,
+    orig_borough,
+    dest_borough,
+    orig_bg,
+    dest_bg,
+    home_bg,
+    work_bg,
+    orig_type,
+    dest_type,
+    departure_datetime = departure_date,
+    arrival_datetime = arrival_date,
+    traveldate_dow,
+    mode_group_10 = mode_g10,
+    modeflag_walkjogwheelchair,
+    modeflag_bike,
+    modeflag_citibike,
+    trip_eval,
+    num_transit_legs,
+    access_mode = access,
+    egress_mode = egress,
+    subsidy_fare = commute_subsidy_1,
+    subsidy_park = commute_subsidy_2,
+    subsidy_toll = commute_subsidy_3,
+    trip_distance = distance,
+    trip_weight_wd = per_weight_wd_trips_rsadj,
+    trip_weight_sat = per_weight_sat_rsadj,
+    trip_weight_sun = per_weight_sun_rsadj) |> 
+  
+  mutate(
+    # trip id to character
+    trip_id = as.character(trip_id),
+    hh_id = as.character(hh_id),
+    gender = as_factor(gender),
+    age = as_factor(age),
+    education_level = as_factor(education_level),
+    driv_license = as_factor(driv_license),
+    disability = as_factor(disability),
+    subsidy_fare = as_factor(subsidy_fare),
+    subsidy_park = as_factor(subsidy_park),
+    subsidy_toll = as_factor(subsidy_toll),
+    
+    # trip duration from survey times
+    trip_duration_survey = time_length(
+        difftime(arrival_datetime, departure_datetime, units = "mins"), 
+      unit = "minutes"),
+    
+    trip_duration_survey = case_when(
+      trip_duration_survey < 0 ~ 0,
+      .default = trip_duration_survey),
+    
+    # generalize trip weight
+    trip_day = case_when(
+      wday(departure_datetime) == 7 ~ "sat",
+      wday(departure_datetime) == 1 ~ "sun",
+      .default = "wd"),
+    
+    trip_weight = coalesce(
+      trip_weight_wd, 
+      trip_weight_sat,
+      trip_weight_sun),
+    
+    # classify trip modes
+    trip_mode = case_when(
+      mode_group_10 %in% car_mode_list ~ "CAR",
+      mode_group_10 %in% transit_mode_list ~ "TRANSIT",
+      mode_group_10 == "Walk/Bike" &
+        modeflag_walkjogwheelchair == "Selected" &
+        modeflag_bike != "Selected" &
+        modeflag_citibike != "Selected" ~ "WALK",
+      mode_group_10 == "Walk/Bike" &
+        (modeflag_bike == "Selected" |
+           modeflag_citibike == "Selected") ~ "BICYCLE",
+      .default = "OTHER"),
+    
+    svyday_id = case_when(
+      day_num == "First day of travel period" ~ 1,
+      day_num == "Second day of travel period" ~ 2,
+      day_num == "Third day of travel period" ~ 3,
+      day_num == "Fourth day of travel period" ~ 4,
+      day_num == "Fifth day of travel period" ~ 5,
+      day_num == "Sixth day of travel period" ~ 6,
+      day_num == "Seventh day of travel period" ~ 7,
+      .default = 9999)
+    ) |> 
+  
+  # filter out other modes
+  #filter(trip_mode != "OTHER") |> 
+  
+  # order trip mode factor
+  mutate(trip_mode = fct_relevel(trip_mode, "WALK", "BICYCLE", "TRANSIT", "CAR")) |> 
+  select(-trip_weight_wd, -trip_weight_sat, -trip_weight_sun)
+```
+
+## Prepare Person Data
+### Person Weights
+
+Define person weights from the sample. These are sampling weights.
+
+```{r}
+nycts_person_weights <- nycts_2018_person |> 
+  select(person_id = personid, starts_with("per_weight"), ends_with("complete")) |> 
+  mutate(
+    per_weight_day_wd = case_when(
+      is.na(per_weight_wd) ~ 0,
+      .default = per_weight_wd / weekdays_complete),
+    
+    per_weight_day_sat = case_when(
+      is.na(per_weight_sat) ~ 0,
+      .default = per_weight_sat / saturday_complete),
+    
+    per_weight_day_sun = case_when(
+      is.na(per_weight_sun) ~ 0,
+      .default = per_weight_sun / sunday_complete)
+  ) |> 
+  select(person_id, starts_with("per_weight_day"))
+```
+
+### Prepare Person Socioeconomic and Demographic Attributes
+
+```{r}
+nycts_person_seds <- nycts_2018_linked |>
+  group_by(person_id) |>
+  summarize(
+    hh_income = first(hh_income),
+    gender = first(gender),
+    age = first(age),
+    education_level = first(education_level),
+    driv_license = first(driv_license),
+    disability = first(disability),
+    home_bg = first(home_bg),
+    work_bg = first(work_bg)
+  ) |>
+  mutate(
+    hh_income = fct_collapse(
+      hh_income,
+      "Less than $25,000" = c(
+        "Less than $12,000",
+        "$12,000 - $15,999",
+        "$16,000- $19,999",
+        "$20,000 - $24,999"
+      ),
+      "$25,000 - $49,999" = c(
+        "$25,000 - $28,999",
+        "$29,000 - $32,999",
+        "$33,000 - $36,999",
+        "$37,000 - $40,999",
+        "$41,000 - $49,999"
+      ),
+      "$50,000 - $74,999" = "$50,000 - $74,999",
+      "$75,000 - $99,999" = "$75,000 - $99,999",
+      "$100,000 - $149,999" = "$100,000 - $149,999",
+      "$150,000 or greater" = c("$150,000 - $199,999", "$200,000 - $299,999", "$300,000 or more")
+    ),
+    hh_income = fct_relevel(
+      hh_income,
+      "Less than $25,000",
+      "$25,000 - $49,999",
+      "$50,000 - $74,999",
+      "$75,000 - $99,999",
+      "$100,000 - $149,999",
+      "$150,000 or greater"
+    ),
+    age = fct_collapse(
+      age,
+      "0-4 years" = "Under 5 years old",
+      "5-17 years" = c("5-15 years", "16-17 years"),
+      "18-34 years" = c("18-24 years", "25-29 years", "30-34 years"),
+      "35-49 years" = c("35-39 years", "40-44 years", "45-49 years"),
+      "50-64 years" = c("50-54 years", "55-59 years", "60-64 years"),
+      "65 and older" = c(
+        "65-69 years",
+        "70-74 years",
+        "75-79 years",
+        "80-84 years",
+        "85 or years older"
+      )
+    ),
+    age = fct_relevel(
+      age,
+      "0-4 years",
+      "5-17 years",
+      "18-34 years",
+      "35-49 years",
+      "50-64 years",
+      "65 and older"
+    )
+  )
+```
+
+# Get POI Data
+
+```{r}
+nyc_places_path <- fs::dir_create(fs::path(data_path, "overture_places"))
+```
+
+```{r}
+#| eval: false
+overture_place_themes <- read_csv("./data/overture_place_themes.csv") |> 
+  select(2:1) |> 
+  deframe()
+
+study_area_bbox <- boundaries_boroughs |> 
+  st_bbox()
+
+nyc_places <- overtureR::open_curtain(type = "place", spatial_filter = study_area_bbox) |> 
+  transmute(
+    id,
+    primary_name = names$primary,
+    x = bbox$xmin,
+    y = bbox$ymin,
+    main_category = categories$primary,
+    primary_source = sources[[1]]$dataset,
+    confidence,
+   geometry # currently no duckdb spatial implementation
+  ) |> 
+  filter(confidence > .90) |> 
+  collect() |> 
+  mutate(theme_primary = overture_place_themes[main_category]) |> 
+  drop_na(theme_primary)
+
+# save it to downloads so we don't keep downloading new data
+save(nyc_places, file = fs::path(nyc_places_path, "nyc_places.Rdata"))
+```
+
+```{r}
+load(file = fs::path(nyc_places_path, "nyc_places.Rdata"))
+```
+
+# Save
+
+```{r}
+save(
+  dtplyr_uncount, 
+  sfc_as_cols, 
+  boundaries_boroughs,
+  boundaries_base,
+  census_bg_2010,
+  nycts_2018_linked,
+  nycts_person_weights,
+  nycts_person_seds,
+  nyc_places,
+  file = "./output/01_data.Rdata")
+```

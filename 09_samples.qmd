@@ -1,0 +1,503 @@
+---
+title: "Untitled"
+format: html
+---
+
+
+```{r}
+options(java.parameters = "-Xmx96G")
+
+library(tidyverse)
+library(dtplyr)
+library(fs)
+library(sf)
+library(sfheaders)
+library(stars)
+library(terra)
+library(tmap)
+
+library(tinytable)
+
+library(r5r)
+
+## Load Data
+data_path <- fs::dir_create("./data")
+output_path <- fs::dir_create("./output")
+
+load(file = "./output/01_data.Rdata")
+load(file = "./output/02_episodes.Rdata")
+load(file = "./output/03_st_paths.Rdata")
+load(file = "./output/05_stv_calculator.Rdata")
+```
+
+## Make Some Sample Travel Data
+
+```{r}
+sample_person_1 <- nycts_2018_linked |> 
+  filter(person_id == "2201" & svyday_id == 2) |> 
+  mutate(
+    departure_datetime = case_when(
+      row_number() == 1 ~ ymd_hms("2018-03-16  6:45:00"), .default = departure_datetime
+    ),
+    departure_datetime = case_when(
+      row_number() == 2 ~ ymd_hms("2018-03-16  16:30:00"), .default = departure_datetime
+    ),
+    departure_datetime = case_when(
+      row_number() == 3 ~ ymd_hms("2018-03-16  17:15:00"), .default = departure_datetime
+    ),
+    departure_datetime = case_when(
+      row_number() == 4 ~ ymd_hms("2018-03-16  18:25:00"), .default = departure_datetime
+    ),
+    departure_datetime = case_when(
+      row_number() == 5 ~ ymd_hms("2018-03-16  19:55:00"), .default = departure_datetime
+    ),
+    arrival_datetime = case_when(
+      row_number() == 1 ~ ymd_hms("2018-03-16  7:00:00"), .default = arrival_datetime
+    ),
+    arrival_datetime = case_when(
+      row_number() == 2 ~ ymd_hms("2018-03-16  16:45:00"), .default = arrival_datetime
+    ),
+    arrival_datetime = case_when(
+      row_number() == 3 ~ ymd_hms("2018-03-16  17:25:00"), .default = arrival_datetime
+    ),
+    arrival_datetime = case_when(
+      row_number() == 4 ~ ymd_hms("2018-03-16  18:35:00"), .default = arrival_datetime
+    ),
+    arrival_datetime = case_when(
+      row_number() == 5 ~ ymd_hms("2018-03-16  20:00:00"), .default = arrival_datetime
+    )
+  ) |> 
+  mutate(
+    person_id = 1, svyday_id = 1,
+    trip_id = paste0(person_id, svyday_id, "00", row_number())
+  )
+```
+
+# Get Episodes
+
+```{r}
+sample_episodes <- episode_builder(sample_person_1)
+```
+
+don't know what is causing the parse warning, something with lubridate in the case_when?
+
+## Person Weights
+
+add person weights
+
+```{r}
+sample_episodes <- sample_episodes |> 
+  mutate(per_weight = 1)
+```
+
+episode tables
+
+```{r}
+activites_short_names <- c(
+  "Initial Stay" = "Initial Stay",
+  "Transit" = "Transit",
+  "Work" = "Work",
+  "Walk" = "Walk",
+  "Home" = "Home",
+  "Restaurant (dine-in or take-out)" = "Restaurant",
+  "Friend/Family member’s house" = "Friend/Family",
+  "Last Stay" = "Last Stay",
+  "K-12 School or daycare" = "Education",
+  "Shopping" = "Shopping",
+  "Recreation/Entertainment/Exercise (e.g., movies, theater, park)" = "Recreation",
+  "Errands or personal business (e.g. bank, post office)" = "Errands",
+  "Other" = "Other",
+  "Car" = "Car",
+  "Work-related place (e.g., meeting, second job, delivery)" = "Work-related",
+  "Missing" = "Missing",
+  "Religious (e.g., church, synagogue)" = "Religious",
+  "Airport" = "Airport",
+  "Doctor/Medical Service/Hospital" = "Medical",
+  "College/University" = "University",
+  "Bicycle" = "Bicycle"
+) |> 
+  enframe() |> 
+  #select(2:1) |> 
+  deframe()
+
+
+trip_table <- sample_episodes |> select(
+  person_id,
+  #svyday_id,
+  trip_id,
+  trip_mode,
+  departure_time = start_datetime,
+  arrival_time = end_datetime,
+  origin_type = start_activity_type,
+  dest_type = end_activity_type,
+  #origin_bg = start_bg,
+  #dest_bg = end_bg
+) |> 
+  drop_na() |> 
+  mutate(
+    departure_time = hms::as_hms(departure_time),
+    arrival_time = hms::as_hms(arrival_time),
+    origin_type = activites_short_names[origin_type],
+         dest_type = activites_short_names[dest_type])
+
+
+
+episode_table <- sample_episodes |> select(
+  person_id,
+  episode_id,
+  activity_class,
+  activity_desc,
+  #svyday_id,
+  #trip_id,
+  #trip_mode,
+  start_time = start_datetime,
+  end_time = end_datetime,
+  start_activity_type,
+  end_activity_type,
+  #start_bg,
+  #end_bg
+) |> 
+  mutate(
+    start_time = hms::as_hms(start_time),
+    end_time = hms::as_hms(end_time),
+    activity_desc = activites_short_names[activity_desc],
+    start_activity_type = activites_short_names[start_activity_type],
+    end_activity_type = activites_short_names[end_activity_type])
+
+
+
+intermediate_table <- episode_table |>
+  mutate(
+    #person_id = case_when(row_number() %% 2 == 1 ~ NA, .default = person_id), 
+    start_time = case_when(row_number() %% 2 == 1 ~ NA_character_, .default = as.character(start_time)), 
+    end_time = case_when(row_number() %% 2 == 1 ~ NA_character_, .default = as.character(end_time)),
+    #activity_class = case_when(row_number() %% 2 == 1 ~ NA_character_, .default = activity_class),
+    activity_desc = case_when(row_number() %% 2 == 1 ~ NA_character_, .default = activity_desc),
+    start_activity_type = case_when(row_number() %% 2 == 1 ~ NA_character_, .default = start_activity_type),
+    end_activity_type = case_when(row_number() %% 2 == 1 ~ NA_character_, .default = end_activity_type),
+    )
+
+trip_table |> tt() |>  style_tt(fontsize = .75) |> theme_tt("spacing")
+intermediate_table |> tt() |> format_tt(replace = "-") |> style_tt(fontsize = .75) |> theme_tt("spacing")
+episode_table |> tt() |>  style_tt(fontsize = .75) |> theme_tt("spacing")
+```
+
+# Make Space-time Paths
+
+get census zone centroid point coordinates
+
+```{r}
+census_bg_2010_centroids <- census_bg_2010 |> 
+  st_centroid() |> 
+  mutate(
+    centroid_x = sf::st_coordinates(geometry)[,1],
+    centroid_y = sf::st_coordinates(geometry)[,2]
+  ) |> 
+  select(BlockGroup_GEOID, centroid_x, centroid_y, geometry)
+```
+
+build paths
+
+```{r}
+sample_st_paths <- st_path_builder(sample_episodes, centroids = census_bg_2010_centroids)
+```
+
+```{r}
+#st_write(st_paths |> mutate(activity_duration = as.numeric(activity_duration)), "./arcgis_pro/st_paths_test_2201.gpkg")
+```
+
+## Filter Paths
+
+```{r}
+# get activities
+flex_activities <- c(
+  "Restaurant (dine-in or take-out)",
+  "Recreation/Entertainment/Exercise (e.g., movies, theater, park)",
+  "Shopping"
+)
+```
+
+```{r}
+# extract flexible activity episodes
+sample_flex_segments <- sample_st_paths |> 
+  #filter(person_id == 5101) |> 
+  group_by(person_id, timeblock_id) |> 
+  #filter(
+  #  valid_stay_location != "no" & 
+  #    valid_stay_trip_sequence != "no" & 
+  #    valid_svyday_sequence != "no") |> 
+  mutate(
+    # classify valid episode chains
+    valid_cones = case_when(
+      # is a flexible activity
+      activity_desc %in% flex_activities & 
+        # bounded by a trip to the activity that occurs immediately prior to the activity
+        # non-nyc will be omitted due to missing line segments in workbook 3
+        (!is.na(lag(trip_id)) & start_datetime == lag(end_datetime)) &
+        # bounded by a trip from the activity that occurs immediately after to the activity
+        (!is.na(lead(trip_id)) & end_datetime == lead(start_datetime)) ~ "yes",
+      .default = "no"
+        )
+  ) |> 
+  
+  # keep only valid cases
+  filter(
+    valid_cones == "yes" |
+      # previous episode
+      (lag(valid_cones) == "yes") |
+      
+      # next episode
+      (lead(valid_cones) == "yes")
+    ) |> 
+  group_by(person_id) |> 
+  
+  # create an id for the flexible sequences
+  mutate(flexseq_id = cumsum(start_datetime != lag(end_datetime, default = first(end_datetime))) + 1) |> 
+  
+  # get geometry as a column from lines
+  mutate(
+    start_x =  sf::st_coordinates(lwgeom::st_startpoint(geometry))[,1],
+    start_y = sf::st_coordinates(lwgeom::st_startpoint(geometry))[,2],
+    end_x = sf::st_coordinates(lwgeom::st_endpoint(geometry))[,1],
+    end_y = sf::st_coordinates(lwgeom::st_endpoint(geometry))[,2]) |> 
+  st_drop_geometry() |>
+  
+  # summarize down to one row for each flex segment
+  group_by(person_id, timeblock_id, flexseq_id) |>
+  summarize(
+    num_episodes = n(),
+    start_trip_mode = first(trip_mode),
+    end_trip_mode = last(trip_mode),
+    start_datetime = first(start_datetime),
+    end_datetime = last(end_datetime),
+    time_window = sum(activity_duration),
+    per_weight = first(per_weight),
+    start_x = first(start_x),
+    start_y = first(start_y),
+    end_x = last(end_x),
+    end_y = last(end_y)
+  ) |> 
+  ungroup() |> 
+  tidyr::unite(col = "id", c(person_id, timeblock_id, flexseq_id))
+```
+
+add another flex segment for comparison
+
+```{r}
+sample_flex_segments <- sample_flex_segments |> 
+  mutate(count = 2) |> 
+  tidyr::uncount(count, .id = "count_id") |> 
+  mutate(
+    start_x = case_when(count_id == 2 ~ 591000, .default = start_x),
+    end_x = case_when(count_id == 2 ~ 591000, .default = end_x),
+    start_y = case_when(count_id == 2 ~ 4513500, .default = start_y),
+    end_y = case_when(count_id == 2 ~ 4513500, .default = end_y),
+    start_datetime = case_when(count_id == 2 ~ start_datetime + minutes(120), .default = start_datetime),
+    end_datetime = case_when(count_id == 2 ~ start_datetime + minutes(100), .default = end_datetime),
+    id = case_when(count_id == 2 ~ "2_1_1", .default = id),
+    time_window = difftime(end_datetime, start_datetime, units = "mins")
+  )
+```
+
+# Routing
+
+```{r}
+r5_path_forward <- dir_create("./r5_graph_forward")
+r5_graph_forward <- r5r::build_network(data_path = r5_path_forward)
+
+r5_path_reverse <- fs::dir_create("./r5_graph_reverse")
+r5_graph_reverse <- r5r::build_network(data_path = r5_path_reverse)
+```
+
+## Prepare 10m study area grid
+
+```{r}
+cell_size = 10
+
+study_area_bbox <- boundaries_boroughs |> 
+  filter(NAMELSAD == "New York County") |> 
+  st_buffer(1000) |> 
+  st_bbox()
+
+study_area_boundaries <- boundaries_boroughs |> 
+  st_crop(study_area_bbox) |> 
+  st_collection_extract("POLYGON")
+
+study_area_raster <- study_area_boundaries |>
+  select(geometry) |> 
+  st_rasterize(
+    template = st_as_stars(
+      study_area_bbox,
+      dx = cell_size,
+      dy = cell_size,
+      pretty = TRUE,
+      values = NA_real_))
+
+study_area_points <- study_area_raster |> 
+  st_xy2sfc(as_points = TRUE) |> 
+  st_as_sf() |> 
+  select(-ID) |> 
+  mutate(id = as.character(row_number()))
+
+study_area_polygons <- study_area_raster |> 
+  st_xy2sfc(as_points = FALSE) |> 
+  st_as_sf() |> 
+  select(-ID) |> 
+  st_join(study_area_points)
+```
+
+## Get Opportunities in Intervening Grid Cells
+
+```{r}
+overture_flexthemes <- c(
+  "active_life",
+  "arts_and_entertainment",
+  "attractions_and_activities",
+  "eat_and_drink",
+  "retail"
+)
+
+# count opportunities by cell
+nyc_places_flex <- nyc_places |> 
+  rename(poi_id = id) |> 
+  filter(theme_primary %in% overture_flexthemes) |> 
+  st_transform(crs = 26918) |> 
+  st_join(study_area_polygons) |>
+  drop_na(id) |> 
+  st_drop_geometry() |> 
+  group_by(id) |> 
+  summarize(opp_weight = n())
+
+# join back to study area points
+study_area_points <- study_area_points |> 
+  left_join(nyc_places_flex, by = "id") |> 
+  mutate(opp_weight = replace_na(opp_weight, 0))
+
+opportunities_raster <- study_area_points |> 
+  select(-id) |> 
+  filter(opp_weight > 0) |> 
+  st_as_stars() |> 
+  st_sfc2xy()
+```
+
+## Define Time Reversal Function
+
+```{r}
+#| label: define reverse time and datetime functions
+# define reverse time function
+reverse_time <- function(forward_time){
+  hh_rev = str_pad(abs(hour(forward_time) - 23), width = 2, side = "left", pad = "0")
+  mm_rev = str_pad(abs(minute(forward_time) - 59), width = 2, side = "left", pad = "0")
+  ss_rev = str_pad(abs(second(forward_time) - 59), width = 2, side = "left", pad = "0")
+  time_rev = paste(hh_rev, mm_rev, ss_rev, sep = ":")
+  return(time_rev)
+}
+
+# define reverse datetime function
+reverse_datetime <- function(forward_datetime) {
+  forward_date = as_date(forward_datetime)
+  time_rev = reverse_time(forward_datetime)
+  datetime_rev = ymd_hms(paste(forward_date, time_rev, sep = " "))
+  return(datetime_rev)
+}
+```
+
+## Calculate Space-time Voxels
+
+```{r}
+stv_sample_path <- fs::dir_create("./stvs_sample_10m")
+time_unit = 5
+
+tictoc::tic()
+sample_flex_segments |> 
+  drop_na() |> 
+  filter(start_trip_mode != "OTHER" & end_trip_mode != "OTHER") |> 
+  group_by(id) |> 
+  group_walk(~ stv_calculator(
+    data = .x, 
+    group_keys = .y, 
+    intermediate_points = study_area_points,
+    time_unit = time_unit, # minutes
+    output_path = stv_sample_path))
+  
+tictoc::toc()
+```
+
+# Get Stars Objects
+## STVs
+
+```{r}
+stvs_sample <- arrow::open_dataset("./stvs_sample_10m") |> 
+  collect() |> 
+  mutate(
+    z = as.numeric(difftime(
+      t, 
+      lubridate::floor_date(t, unit = "day"),
+      units = "mins")
+    )) |> 
+  select(x, y, level = z, person_id, dwell_time) |> 
+  arrange(x, y, level)
+
+stvs_sample_person_1_stars <- stvs_sample |> 
+  filter(person_id == 1) |> 
+  st_as_stars(dims = c("x", "y", "level")) |> 
+  st_set_crs(26918)
+
+stvs_sample_person_2_stars <- stvs_sample |> 
+  filter(person_id == 2) |> 
+  st_as_stars(dims = c("x", "y", "level")) |> 
+  st_set_crs(26918)
+```
+
+```{r}
+#| eval: false
+write_mdim(stvs_sample_person_1_stars, "./arcgis_pro/stvs_sample_person_1_stars.nc")
+write_mdim(stvs_sample_person_2_stars, "./arcgis_pro/stvs_sample_person_2_stars.nc")
+```
+
+## PPA Rasters
+
+```{r}
+pasta_sample_person_1 <- arrow::open_dataset("./stvs_sample_10m") |> 
+  filter(person_id == 1) |> 
+  collect() |> 
+  group_by(x, y) |> 
+  summarize(dwell_time = sum(dwell_time)) |> 
+  select(x, y, dwell_time) |> 
+  arrange(x, y) |> 
+  st_as_stars(dims = c("x", "y")) |> 
+  st_set_crs(26918)
+
+pasta_sample_person_2 <- arrow::open_dataset("./stvs_sample_10m") |> 
+  filter(person_id == 2) |> 
+  collect() |> 
+  group_by(x, y) |> 
+  summarize(dwell_time = sum(dwell_time)) |> 
+  select(x, y, dwell_time) |> 
+  arrange(x, y) |> 
+  st_as_stars(dims = c("x", "y")) |> 
+  st_set_crs(26918)
+
+pasta_sample <- arrow::open_dataset("./stvs_sample_10m") |> 
+  collect() |> 
+  group_by(x, y) |> 
+  summarize(dwell_time = sum(dwell_time)) |> 
+  select(x, y, dwell_time) |> 
+  arrange(x, y) |> 
+  st_as_stars(dims = c("x", "y")) |> 
+  st_set_crs(26918)
+```
+
+```{r}
+#| eval: false
+stars::write_stars(pasta_sample_person_1, "./arcgis_pro/pasta_sample_person_1.tif")
+stars::write_stars(pasta_sample_person_2, "./arcgis_pro/pasta_sample_person_2.tif")
+stars::write_stars(pasta_sample, "./arcgis_pro/pasta_sample.tif")
+```
+
+# Save Output
+
+```{r}
+save(trip_table, intermediate_table, episode_table, file = "./output/09_samples.Rdata")
+```
+

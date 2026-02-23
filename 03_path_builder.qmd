@@ -1,0 +1,117 @@
+---
+title: "03_path_builder"
+format: html
+---
+
+# Setup
+
+```{r}
+library(tidyverse)
+library(fs)
+library(sf)
+library(sfheaders)
+```
+
+load data
+
+```{r}
+output_path <- fs::dir_create("./output")
+load(file = fs::path(output_path, "01_data.Rdata"))
+load(file = fs::path(output_path, "02_episodes.Rdata"))
+```
+
+# Space-time Path Builder
+
+get census zone centroid point coordinates
+
+```{r}
+census_bg_2010_centroids <- census_bg_2010 |> 
+  st_centroid() |> 
+  mutate(
+    centroid_x = sf::st_coordinates(geometry)[,1],
+    centroid_y = sf::st_coordinates(geometry)[,2]
+  ) |> 
+  select(BlockGroup_GEOID, centroid_x, centroid_y, geometry)
+```
+
+Define space-time path builder function
+
+```{r}
+st_path_builder <- function(episodes, centroids) {
+  st_paths = episodes |>
+    left_join(
+      centroids |>
+        st_drop_geometry() |>
+        select(BlockGroup_GEOID, centroid_x, centroid_y),
+      by = c("start_bg" = "BlockGroup_GEOID")
+    ) |>
+    rename(x_start = centroid_x, y_start = centroid_y) |>
+    
+    # get y coordinates from zones
+    left_join(
+      centroids |>
+        st_drop_geometry() |>
+        select(BlockGroup_GEOID, centroid_x, centroid_y),
+      by = c("end_bg" = "BlockGroup_GEOID")
+    ) |>
+    rename(x_end = centroid_x, y_end = centroid_y) |>
+    
+    # get z coordinates from times
+    #group_by(person_id, svyday_id) |>
+    group_by(person_id) |>
+    mutate(
+      z_end = cumsum(round(as.numeric(
+        activity_duration
+      ), 0)),
+      #z_end = case_when(z_end > 1440 ~ 1440, .default = z_end), # don't do this - some trips occur overnight
+      z_start = lag(z_end),
+      z_start = case_when(is.na(z_start) ~ 0, .default = z_start)
+    ) |>
+    ungroup() |>
+    
+    pivot_longer(
+      cols = c(starts_with("x_"), starts_with("y_"), starts_with("z_")),
+      names_to = c("dim", "loc"),
+      values_to = c("coord"),
+      names_sep = "_"
+    ) |>
+    pivot_wider(
+      id_cols = c("person_id", "svyday_id", "episode_id", "loc"),
+      names_from = c("dim"),
+      values_from = "coord"
+    ) |>
+    
+    # create lines
+    arrange(person_id, svyday_id, episode_id) |>
+    group_by(person_id, svyday_id, episode_id) |>
+    mutate(line_id = cur_group_id()) |>
+    ungroup() |>
+    group_by(line_id) |>
+    
+    # filter out lines with missing coordinate values (not in NYC)
+    filter(all(!is.na(x)) & all(!is.na(y)) & all(!is.na(z))) |>
+    ungroup() |>
+    sfheaders::sf_linestring(
+      x = "x",
+      y = "y",
+      z = "z",
+      linestring_id = "line_id",
+      keep = TRUE
+    ) |>
+    st_set_crs(26918) |>
+    #mutate(valid_geom = !st_is_empty(geometry)) |>
+    left_join(episodes, by = c("person_id", "svyday_id", "episode_id"))
+  
+  return(st_paths)
+}
+```
+
+```{r}
+st_paths <- st_path_builder(episodes, centroids = census_bg_2010_centroids)
+```
+
+# Save
+
+```{r}
+save(st_path_builder, st_paths, file = "./output/03_st_paths.Rdata")
+```

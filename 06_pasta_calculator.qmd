@@ -1,0 +1,568 @@
+---
+title: "06_pasta_calculator"
+format: html
+---
+
+```{r}
+library(tidyverse)
+library(fs)
+library(sf)
+library(stars)
+library(tmap)
+
+library(arrow)
+library(duckdb)
+library(dbplyr)
+
+library(job)
+library(modelsummary)
+```
+
+# Load STVs
+
+```{r}
+# load output
+output_path <- fs::dir_create("./output")
+load(file = fs::path(output_path, "01_data.Rdata"))
+load(file = fs::path(output_path, "05_stv_calculator.Rdata"))
+```
+
+## Flex Segment Tables
+
+```{r}
+#| warning: false
+
+flex_segments |> 
+  separate(col = id, into = c("person_id", "timeblock_id", "flexseq_id"), sep = "_") |> 
+  mutate(person_id = as.numeric(person_id)) |> 
+  left_join(nycts_person_seds, by = "person_id") |> 
+  filter(start_trip_mode != "OTHER") |>
+  mutate(
+    start_trip_mode = fct_drop(start_trip_mode),
+    start_trip_mode = fct_recode(
+      start_trip_mode, Walk = "WALK", Bicycle = "BICYCLE", Transit = "TRANSIT", Car = "CAR"),
+    time_budget = as.numeric(time_window),
+    gender = fct_collapse(gender, Other = c("Do not identify with male or female", "Other")),
+    std_wday = case_when(
+      wday(start_datetime) == 1 ~ "Sunday",
+      wday(start_datetime) == 7 ~ "Saturday",
+      TRUE ~ "Weekday"),
+    std_wday = fct_relevel(std_wday, "Weekday", "Saturday", "Sunday")
+    ) |> 
+  select(
+    `FC Trip Mode` = start_trip_mode, 
+    Gender = gender, Age = age, 
+    `Household income` = hh_income,
+    `Time budget (mins)` = time_budget, 
+    `Number of episodes` = num_episodes,
+    weights = per_weight,
+    std_wday) |>
+  modelsummary::datasummary_balance(formula = ~ std_wday)
+  
+
+
+#flex_segments2 |> select(start_trip_mode, hh_income, gender, age, time_window, weights = per_weight) |>
+#  mutate(time_window = as.numeric(time_window)) |>
+#  #filter(start_trip_mode != "other") |>
+#  modelsummary::datasummary_balance(formula = ~ start_trip_mode)
+
+#flex_segments2 |> select(start_trip_mode, hh_income, gender, age, time_window, weights = per_weight) |>
+#  mutate(time_window = as.numeric(time_window)) |>
+#  filter(start_trip_mode != "OTHER") |>
+#  modelsummary::datasummary_balance(formula = ~ hh_income)
+```
+
+
+
+# Examine STVs
+
+```{r}
+#| eval: false
+
+stp_2201 <- arrow::open_dataset("./stvs_flex_100m") |>
+  filter(person_id == 2201) |> 
+  collect() |> 
+  mutate(
+    #vox_base_datetime = ymd_hms(date(vox_z), " 00:00:00"))
+    z = difftime(
+      t, 
+      ymd_hms(paste0(date(t), " 00:00:00")), 
+      units = "mins")) |> 
+  st_as_stars(dims = c("x", "y", "z")) |>
+  st_set_crs(26918)
+
+stp_5101 <- arrow::open_dataset("./stvs_flex_100m") |>
+  filter(person_id == 5101) |> 
+  collect() |> 
+  mutate(
+    #vox_base_datetime = ymd_hms(date(vox_z), " 00:00:00"))
+    z = difftime(
+    t, 
+    ymd_hms(paste0(date(t), " 00:00:00")), 
+    units = "mins")) |> 
+  st_as_stars(dims = c("x", "y", "z")) |>
+  st_set_crs(26918)
+```
+
+
+# Aggregate PPVs
+
+## By Day
+
+```{r}
+pasta_by_day <- arrow::open_dataset("./stvs_flex_100m") |>
+  arrow::to_duckdb() |>
+  filter(dwell_time > 0) |>
+  mutate(std_wday = case_when(
+    wday(as_datetime(t)) == 1 ~ "sunday",
+    wday(as_datetime(t)) == 7 ~ "saturday",
+    TRUE ~ "weekday"
+  )) |>
+  group_by(x, y, std_wday) |>
+  summarize(
+    dwell_time = sum(dwell_time),
+    w_dwell_time = sum(dwell_time * per_weight)
+  ) |>
+  ungroup() |>
+  collect() |>
+  mutate(std_wday = fct_relevel(std_wday, "weekday", "saturday", "sunday")) |>
+  st_as_stars(dims = c("x", "y", "std_wday")) |>
+  st_set_crs(26918)
+```
+
+## By Time Period
+
+```{r}
+pasta_by_period_and_day <- arrow::open_dataset("./stvs_flex_100m") |>
+  arrow::to_duckdb() |>
+  filter(dwell_time > 0) |>
+  mutate(
+    std_wday = case_when(
+      wday(as_datetime(t)) == 1 ~ "sunday",
+      wday(as_datetime(t)) == 7 ~ "saturday",
+      TRUE ~ "weekday"
+    ),
+    period = case_when(
+      hour(as_datetime(t)) < 3 ~ "late (10pm to 3am)",
+      hour(as_datetime(t)) < 7 ~ "early (3am to 7am)",
+      hour(as_datetime(t)) < 10 ~ "am peak (7am to 10am)",
+      hour(as_datetime(t)) < 16 ~ "midday (10am to 4pm)",
+      hour(as_datetime(t)) < 19 ~ "pm peak (4pm to 7pm)",
+      hour(as_datetime(t)) < 22 ~ "evening (7pm to 10pm)",
+      TRUE ~ "late (10pm to 3am)"
+    )
+  ) |>
+  group_by(x, y, period, std_wday) |>
+  summarize(
+    dwell_time = sum(dwell_time),
+    w_dwell_time = sum(dwell_time * per_weight)
+  ) |>
+  ungroup() |>
+  collect() |>
+  mutate(
+    std_wday = fct_relevel(std_wday, "weekday", "saturday", "sunday"),
+    period = fct_relevel(
+      period,
+      "early (3am to 7am)",
+      "am peak (7am to 10am)",
+      "midday (10am to 4pm)",
+      "pm peak (4pm to 7pm)",
+      "evening (7pm to 10pm)",
+      "late (10pm to 3am)"
+    )
+  ) |>
+  st_as_stars(dims = c("x", "y", "period", "std_wday")) |>
+  st_set_crs(26918)
+```
+
+## By Mode and Day
+
+```{r}
+pasta_by_mode_and_day <- arrow::open_dataset("./stvs_flex_100m") |>
+  arrow::to_duckdb() |>
+  filter(dwell_time > 0) |>
+  mutate(std_wday = case_when(
+    wday(as_datetime(t)) == 1 ~ "sunday",
+    wday(as_datetime(t)) == 7 ~ "saturday",
+    TRUE ~ "weekday"
+  )) |>
+  group_by(x, y, std_wday, fc_trip_mode) |>
+  summarize(
+    dwell_time = sum(dwell_time),
+    w_dwell_time = sum(dwell_time * per_weight)
+  ) |>
+  ungroup() |>
+  collect() |>
+  mutate(
+    fc_trip_mode = fct_recode(
+      fc_trip_mode,
+      bicycle = "BICYCLE",
+      walk = "WALK",
+      transit = "TRANSIT",
+      car = "CAR"
+    ),
+    fc_trip_mode = fct_relevel(fc_trip_mode, "walk", "bicycle", "transit", "car"),
+    std_wday = fct_relevel(std_wday, "weekday", "saturday", "sunday")
+  ) |>
+  st_as_stars(dims = c("x", "y", "std_wday", "fc_trip_mode")) |>
+  st_set_crs(26918)
+```
+
+## By Income
+
+get income brackets
+
+```{r}
+nycts_incomes <- nycts_person_seds |>
+  select(person_id, hh_income) |>
+  arrow::to_duckdb()
+```
+
+join income and summarize
+
+```{r}
+pasta_by_income_and_day <- arrow::open_dataset("./stvs_flex_100m") |>
+  arrow::to_duckdb() |>
+  filter(dwell_time > 0) |>
+  mutate(std_wday = case_when(
+    wday(as_datetime(t)) == 1 ~ "sunday",
+    wday(as_datetime(t)) == 7 ~ "saturday",
+    TRUE ~ "weekday"
+  )) |>
+  group_by(x, y, person_id, std_wday) |>
+  summarize(
+    dwell_time = sum(dwell_time),
+    w_dwell_time = sum(dwell_time * per_weight)
+  ) |>
+  left_join(nycts_incomes, by = "person_id") |>
+  group_by(x, y, hh_income, std_wday) |>
+  summarize(dwell_time = sum(dwell_time),
+            w_dwell_time = sum(w_dwell_time)) |>
+  ungroup() |> 
+  collect() |>
+  drop_na(hh_income) |>
+  mutate(
+    hh_income = fct_relevel(
+      hh_income,
+      "Less than $25,000",
+      "$25,000 - $49,999",
+      "$50,000 - $74,999",
+      "$75,000 - $99,999",
+      "$100,000 - $149,999",
+      "$150,000 or greater"
+    )
+  ) |>
+  drop_na(hh_income) |>
+  st_as_stars(dims = c("x", "y", "hh_income", "std_wday")) |>
+  st_set_crs(26918)
+```
+
+## By Age
+
+```{r}
+nycts_ages <- nycts_person_seds |>
+  select(person_id, age) |> 
+  arrow::to_duckdb()
+```
+
+```{r}
+pasta_by_age_and_day <- arrow::open_dataset("./stvs_flex_100m") |>
+  arrow::to_duckdb() |>
+  filter(dwell_time > 0) |>
+  mutate(std_wday = case_when(
+    wday(as_datetime(t)) == 1 ~ "sunday",
+    wday(as_datetime(t)) == 7 ~ "saturday",
+    TRUE ~ "weekday"
+  )) |>
+  group_by(x, y, person_id, std_wday) |>
+  summarize(
+    dwell_time = sum(dwell_time),
+    w_dwell_time = sum(dwell_time * per_weight)
+  ) |>
+  left_join(nycts_ages, by = "person_id") |>
+  group_by(x, y, age, std_wday) |>
+  summarize(dwell_time = sum(dwell_time),
+            w_dwell_time = sum(w_dwell_time)) |>
+  ungroup() |> 
+  collect() |>
+  drop_na(age) |>
+  mutate(
+    age = fct_relevel(
+      age,
+      "0-4 years",
+      "5-17 years",
+      "18-34 years",
+      "35-49 years",
+      "50-64 years",
+      "65 and older"
+    )
+  ) |>
+  drop_na(age) |>
+  st_as_stars(dims = c("x", "y", "age", "std_wday")) |>
+  st_set_crs(26918)
+```
+
+```{r}
+tm_shape(pasta_by_age_and_day |>
+           filter(std_wday == "weekday") |>
+           select("w_dwell_time")) +
+  tm_raster(
+    col = "w_dwell_time",
+    col.free = TRUE,
+    col.scale =
+      tm_scale_continuous(
+        values = "viridis",
+        label.format = list(digits = 0, big.num.abbr = c("mln" = 6, "K" = 3))
+      ),
+    col.legend = tm_legend(height = 8, title = "") #title = "Dwell Time \n(minutes)")
+  ) +
+  tm_shape(boundaries_boroughs) + tm_polygons(fill = "grey25", zindex = 1) +
+  tm_shape(boundaries_base) + tm_polygons(fill = "grey30", zindex = 2) +
+  tm_facets(nrow = 2) +
+  #tm_facets_flip(ncol = 3) +
+  tm_layout(
+    bg.color = "grey15",
+    legend.bg.color = NA,
+    legend.bg.alpha = 0,
+    #legend.position = c("left", "top"),
+    #legend.text.color = "white",
+    panel.label.frame = FALSE,
+    panel.label.bg.color = NA,
+    between.margin = 0.2
+  )
+```
+
+## By Gender
+
+```{r}
+nycts_genders <- nycts_person_seds |>
+  select(person_id, gender) |> 
+  arrow::to_duckdb()
+
+pasta_by_gender_and_day <- arrow::open_dataset("./stvs_flex_100m") |>
+  arrow::to_duckdb() |>
+  filter(dwell_time > 0) |>
+  mutate(std_wday = case_when(
+    wday(as_datetime(t)) == 1 ~ "sunday",
+    wday(as_datetime(t)) == 7 ~ "saturday",
+    TRUE ~ "weekday"
+  )) |>
+  group_by(x, y, person_id, std_wday) |>
+  summarize(
+    dwell_time = sum(dwell_time),
+    w_dwell_time = sum(dwell_time * per_weight)
+  ) |>
+  left_join(nycts_genders, by = "person_id") |>
+  group_by(x, y, gender, std_wday) |>
+  summarize(dwell_time = sum(dwell_time),
+            w_dwell_time = sum(w_dwell_time)) |>
+  ungroup() |> 
+  collect() |>
+  drop_na(gender) |>
+  mutate(
+    gender = fct_relevel(
+      gender,
+      "Female",
+      "Male",
+      "Other",
+      "Do not identify with male or female"
+    )
+  ) |>
+  drop_na(gender) |>
+  st_as_stars(dims = c("x", "y", "gender", "std_wday")) |>
+  st_set_crs(26918)
+```
+
+
+```{r}
+tm_shape(pasta_by_gender_and_day |>
+           filter(std_wday == "saturday") |>
+           select("w_dwell_time")) +
+  tm_raster(
+    col = "w_dwell_time",
+    col.free = TRUE,
+    col.scale =
+      tm_scale_continuous(
+        values = "viridis",
+        label.format = list(digits = 0, big.num.abbr = c("mln" = 6, "K" = 3))
+      ),
+    col.legend = tm_legend(height = 8, title = "") #title = "Dwell Time \n(minutes)")
+  ) +
+  tm_shape(boundaries_boroughs) + tm_polygons(fill = "grey25", zindex = 1) +
+  tm_shape(boundaries_base) + tm_polygons(fill = "grey30", zindex = 2) +
+  tm_facets(nrow = 2) +
+  #tm_facets_flip(ncol = 3) +
+  tm_layout(
+    bg.color = "grey15",
+    legend.bg.color = NA,
+    legend.bg.alpha = 0,
+    #legend.position = c("left", "top"),
+    #legend.text.color = "white",
+    panel.label.frame = FALSE,
+    panel.label.bg.color = NA,
+    between.margin = 0.2
+  )
+```
+
+## By Home CT
+
+```{r}
+nycts_home_cts <- nycts_person_seds |>
+  select(person_id, age, home_bg) |>
+  mutate(home_ct = str_sub(home_bg, start = 1, end = 11)) |> 
+  select(-home_bg) |> 
+  arrow::to_duckdb()
+```
+
+join home location and summarize
+
+```{r}
+pasta_by_home_ct_and_day <- arrow::open_dataset("./stvs_flex_100m") |>
+  arrow::to_duckdb() |>
+  filter(dwell_time > 0) |>
+  mutate(std_wday = case_when(
+    wday(as_datetime(t)) == 1 ~ "sunday",
+    wday(as_datetime(t)) == 7 ~ "saturday",
+    TRUE ~ "weekday"
+  )) |>
+  group_by(x, y, person_id, fc_trip_mode, std_wday) |>
+  summarize(
+    dwell_time = sum(dwell_time),
+    w_dwell_time = sum(dwell_time * per_weight)
+  ) |>
+  ungroup() |> 
+  # summarize by each person's home ct
+  left_join(nycts_home_cts, by = "person_id") |>
+  group_by(home_ct, age, fc_trip_mode, std_wday) |>
+  summarize(dwell_time = sum(dwell_time),
+            w_dwell_time = sum(w_dwell_time),
+            mean_dwell_time = mean(dwell_time),
+            mean_w_dwell_time = mean(dwell_time)) |>
+  ungroup() |> 
+  collect() #|>
+  #filter(age == "18-34 years" | age == "35-49 years" | age == "50-64 years") 
+  #drop_na(home_ct) |>
+  #st_as_stars(dims = c("x", "y", "home_ct", "std_wday")) |>
+  #st_set_crs(26918)
+```
+
+
+```{r}
+census_ct_2010 <- census_bg_2010 |> 
+  mutate(CensusTract_GEOID = str_sub(BlockGroup_GEOID, start = 1, end = 11)) |> 
+  select(CensusTract_GEOID, geometry) |> 
+  group_by(CensusTract_GEOID) |> 
+  summarize() |> 
+  left_join(pasta_by_home_ct_and_day |> 
+              filter(std_wday == "weekday") |> 
+              filter(age == "18-34 years" | age == "35-49 years" | age == "50-64 years") |> 
+              filter(fc_trip_mode != "CAR"), 
+            by = c("CensusTract_GEOID" = "home_ct"))
+
+tm_shape(census_ct_2010) + 
+  tm_fill(
+    fill = "mean_w_dwell_time",
+    
+    fill.scale =
+      tm_scale_intervals(
+        style = "jenks",
+        values = "viridis",
+        label.format = list(digits = 0, big.num.abbr = c("mln" = 6, "K" = 3))
+      )
+  )
+```
+
+## By Home BG
+
+```{r}
+nycts_home_bgs <- nycts_person_seds |>
+  select(person_id, home_bg) |>
+  arrow::to_duckdb()
+
+
+pasta_by_home_bg360810019001_mode_and_day <- arrow::open_dataset("./stvs_flex_100m") |>
+  arrow::to_duckdb() |>
+  filter(dwell_time > 0) |>
+  mutate(std_wday = case_when(
+    wday(as_datetime(t)) == 1 ~ "sunday",
+    wday(as_datetime(t)) == 7 ~ "saturday",
+    TRUE ~ "weekday"
+  )) |>
+  group_by(x, y, person_id, fc_trip_mode, std_wday) |>
+  summarize(
+    dwell_time = sum(dwell_time),
+    w_dwell_time = sum(dwell_time * per_weight)
+  ) |>
+  left_join(nycts_home_bgs, by = "person_id") |>
+  filter(home_bg == "360810019001") |> 
+  group_by(x, y, fc_trip_mode, std_wday) |> 
+  summarize(dwell_time = sum(dwell_time),
+            w_dwell_time = sum(w_dwell_time, na.rm = TRUE)) |> 
+  ungroup() |> 
+  collect()
+
+pasta_by_home_bg360810019001_mode_and_day <- pasta_by_home_bg360810019001_mode_and_day |> 
+  st_as_stars(dims = c("x", "y", "fc_trip_mode", "std_wday")) |>
+  st_set_crs(26918)
+
+#pasta_by_home_bg_and_day_summaries <- pasta_by_home_bg_and_day |>
+#  group_by(home_bg, std_wday) |> 
+#  summarize(sum_dwell_time = sum(dwell_time),
+#            sum_w_dwell_time = sum(w_dwell_time, na.rm = TRUE),
+#            mean_dwell_time = mean(dwell_time),
+#            mean_w_dwell_time = mean(w_dwell_time, na.rm = TRUE),
+#            med_dwell_time = median(dwell_time),
+#            med_w_dwell_time = median(w_dwell_time, na.rm = TRUE)
+#            ) |>
+#  ungroup() |> 
+#  collect() |>
+#  drop_na(home_bg) #|>
+  #st_as_stars(dims = c("x", "y", "home_bg", "std_wday")) |>
+  #st_set_crs(26918)
+
+#test <- census_bg_2010 |> 
+#  left_join(dt_by_home_bg_and_day, by = c("BlockGroup_GEOID" = "home_bg"))
+```
+
+```{r}
+
+  
+tm_shape(pasta_by_home_bg360810019001_mode_and_day |> select("w_dwell_time") |>  filter(std_wday == "weekday") |> filter(fc_trip_mode == "TRANSIT")) +
+  tm_raster(
+    col = "w_dwell_time",
+    col.free = TRUE,
+    col.scale =
+      tm_scale_continuous(
+        values = "viridis",
+        label.format = list(digits = 0, big.num.abbr = c("mln" = 6, "K" = 3))
+      ),
+    col.legend = tm_legend(height = 8, title = "") #title = "Dwell Time \n(minutes)")
+  ) +
+  tm_shape(boundaries_boroughs) + tm_polygons(fill = "grey25", zindex = 1) +
+  tm_shape(boundaries_base) + tm_polygons(fill = "grey30", zindex = 2) +
+  #tm_facets(nrow = 2) +
+  tm_facets_flip(ncol = 3) +
+  tm_layout(
+    bg.color = "grey15",
+    legend.bg.color = NA,
+    legend.bg.alpha = 0,
+    #legend.position = c("left", "top"),
+    #legend.text.color = "white",
+    panel.label.frame = FALSE,
+    panel.label.bg.color = NA,
+    between.margin = 0.2
+  )
+```
+
+# Save
+
+```{r}
+save(
+  pasta_by_day,
+  pasta_by_period_and_day,
+  pasta_by_mode_and_day,
+  pasta_by_income_and_day,
+  pasta_by_home_bg360810019001_mode_and_day,
+  file = fs::path(output_path, "06_pasta_calculator.Rdata")
+)
+```

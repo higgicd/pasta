@@ -1,0 +1,227 @@
+---
+title: "10_comparisons"
+format: html
+---
+
+```{r}
+#| label: setup
+#options(java.parameters = "-Xmx64G")
+
+library(tidyverse)
+library(patchwork)
+library(dtplyr)
+library(fs)
+library(sf)
+library(stars)
+library(terra)
+library(tmap)
+#library(r5r)
+library(arrow)
+
+output_path <- fs::dir_create("./output")
+load(file = fs::path(output_path, "01_data.Rdata"))
+load(file = fs::path(output_path, "06_pasta_calculator.Rdata"))
+load(file = fs::path(output_path, "07_place_access.Rdata"))
+```
+
+# Get study area grid
+
+```{r}
+cell_size = 100
+
+study_area_bbox <- boundaries_boroughs |> 
+  #filter(NAMELSAD == "New York County") |> 
+  #st_buffer(1000) |> 
+  st_bbox()
+
+study_area_boundaries <- boundaries_boroughs |> 
+  st_crop(study_area_bbox) |> 
+  st_collection_extract("POLYGON")
+
+study_area_raster <- boundaries_boroughs |>
+  select(geometry) |> 
+  st_rasterize(
+    template = st_as_stars(
+      study_area_bbox,
+      dx = cell_size,
+      dy = cell_size,
+      pretty = TRUE,
+      values = NA_real_))
+
+study_area_points <- study_area_raster |> 
+  st_xy2sfc(as_points = TRUE) |> 
+  st_as_sf() |> 
+  select(-ID) |> 
+  mutate(id = as.character(row_number()))
+
+study_area_polygons <- study_area_raster |> 
+  st_xy2sfc(as_points = FALSE) |> 
+  st_as_sf() |> 
+  select(-ID) |> 
+  st_join(study_area_points)
+```
+
+# Gravity Access vs PASTA
+
+## Get PASTA by Mode and Weekday
+
+```{r}
+pasta_walk_weekday <- pasta_by_mode_and_day |>
+  filter(std_wday == "weekday") |>
+  filter(fc_trip_mode == "walk") |> 
+  st_as_sf() |>
+  st_centroid() |>
+  sfc_as_cols() |> 
+  st_drop_geometry() |> 
+  mutate(trip_mode = "walk")
+
+pasta_bicycle_weekday <- pasta_by_mode_and_day |>
+  filter(std_wday == "weekday") |>
+  filter(fc_trip_mode == "bicycle") |> 
+  st_as_sf() |>
+  st_centroid() |>
+  sfc_as_cols() |>
+  st_drop_geometry() |> 
+  mutate(trip_mode = "bicycle")
+
+pasta_transit_weekday <- pasta_by_mode_and_day |>
+  filter(std_wday == "weekday") |>
+  filter(fc_trip_mode == "transit") |> 
+  st_as_sf() |>
+  st_centroid() |>
+  sfc_as_cols() |>
+  st_drop_geometry() |> 
+  mutate(trip_mode = "transit")
+
+pasta_car_weekday <- pasta_by_mode_and_day |>
+  filter(std_wday == "weekday") |>
+  filter(fc_trip_mode == "car") |> 
+  st_as_sf() |>
+  st_centroid() |>
+  sfc_as_cols() |>
+  st_drop_geometry() |> 
+  mutate(trip_mode = "car")
+
+pasta_by_mode_weekday <- bind_rows(pasta_walk_weekday, pasta_bicycle_weekday, pasta_transit_weekday, pasta_car_weekday)
+```
+
+## Market Potential
+
+try to join stars - this is an ugly join
+
+```{r}
+market_walk_weekday <- place_marketpotential_by_mode_weekday_stars |> 
+  filter(trip_mode == "walk") |> 
+  st_as_sf() |> 
+  st_centroid() |> 
+  sfc_as_cols() |>
+  st_drop_geometry() |> 
+  mutate(trip_mode = "walk")
+
+market_bicycle_weekday <- place_marketpotential_by_mode_weekday_stars |> 
+  filter(trip_mode == "bicycle") |> 
+  st_as_sf() |> 
+  st_centroid() |> 
+  sfc_as_cols() |>
+  st_drop_geometry() |> 
+  mutate(trip_mode = "bicycle")
+
+market_transit_weekday <- place_marketpotential_by_mode_weekday_stars |> 
+  filter(trip_mode == "transit") |> 
+  st_as_sf() |> 
+  st_centroid() |> 
+  sfc_as_cols() |>
+  st_drop_geometry() |> 
+  mutate(trip_mode = "transit")
+
+market_car_weekday <- place_marketpotential_by_mode_weekday_stars |> 
+  filter(trip_mode == "car") |> 
+  st_as_sf() |> 
+  st_centroid() |> 
+  sfc_as_cols() |>
+  st_drop_geometry() |> 
+  mutate(trip_mode = "car")
+
+market_by_mode_weekday <- bind_rows(market_walk_weekday, market_bicycle_weekday, market_transit_weekday, market_car_weekday)
+
+pasta_place_by_mode_weekday <- pasta_by_mode_weekday |> 
+  left_join(market_by_mode_weekday, by = c("x", "y", "trip_mode")) |> 
+  mutate(trip_mode = fct_relevel(trip_mode, "walk", "bicycle", "transit", "car"))
+```
+
+Summarize pasta dwell time and gravity market potential over all modes for the weekday
+
+```{r}
+pasta_place_weekday_stars <- pasta_place_by_mode_weekday |> 
+  group_by(x, y) |> 
+  summarize(grav_markpop = sum(grav_markpop, na.rm = TRUE),
+            w_dwell_time = sum(w_dwell_time, na.rm = TRUE)) |> 
+  select(x, y, grav_markpop, w_dwell_time) |> 
+  st_as_stars(dims = c("x", "y")) |>
+  st_set_crs(26918)
+```
+
+## Charts
+
+look at charts for pasta vs market potential
+
+```{r}
+pasta_place_by_mode_weekday |> 
+  drop_na(grav_markpop, w_dwell_time) |> 
+  ggplot(aes(x = grav_markpop, y = w_dwell_time, colour = trip_mode)) + 
+  #geom_point() +
+  geom_point(size = .5, alpha = 0.05) +
+  facet_wrap(vars(trip_mode), scales = "free") +
+  #ggpmisc::stat_poly_line() +
+  #ggpmisc::stat_poly_eq() +
+  #ggpointdensity::geom_pointdensity() + scale_color_viridis_c() +
+  scale_x_continuous(labels = scales::unit_format(unit = "K", scale = 1e-3)) +
+  scale_y_continuous(labels = scales::unit_format(unit = "M", scale = 1e-6)) +
+  viridis::scale_color_viridis(discrete = TRUE, option = "D", end = .97) +
+  guides(colour=guide_legend(override.aes=list(size=1, alpha = 1))) +
+  #geom_rug(alpha = 0.01) +
+  #geom_smooth(method='lm', formula= y~x) +
+  theme_minimal()
+
+pasta_place_by_mode_weekday |>
+  drop_na(grav_markpop, w_dwell_time) |> 
+  group_by(x, y) |> 
+  summarize(grav_markpop = sum(grav_markpop), w_dwell_time = sum(w_dwell_time)) |>
+  ungroup() |> 
+  ggplot(aes(x = grav_markpop, y = w_dwell_time)) + 
+  #geom_point() +
+  geom_point(size = .5, alpha = 0.05) +
+  #facet_wrap(vars(trip_mode), scales = "free") +
+  #ggpmisc::stat_poly_line() +
+  #ggpmisc::stat_poly_eq() +
+  #ggpointdensity::geom_pointdensity() + scale_color_viridis_c() +
+  scale_x_continuous(labels = scales::unit_format(unit = "K", scale = 1e-3)) +
+  scale_y_continuous(labels = scales::unit_format(unit = "M", scale = 1e-6)) +
+  guides(colour=guide_legend(override.aes=list(size=1, alpha = 1))) +
+  #geom_rug(alpha = 0.01) +
+  #geom_smooth(method='lm', formula= y~x) +
+  theme_minimal()
+```
+
+```{r}
+tm_shape(pasta_place_weekday_stars) + tm_raster(
+    col.free = TRUE,
+    col.scale = 
+      tm_scale_continuous(
+        values = "viridis",
+        label.format = list(digits = 0, big.num.abbr = c("mln" = 6, "K" = 3))
+      ),
+    col.legend = tm_legend(height = 8, title = "")
+  ) 
+```
+
+# Save
+
+```{r}
+save(
+  pasta_place_by_mode_weekday,
+  pasta_place_weekday_stars,
+  file = "./output/08_comparisons.Rdata"
+)
+```
+
